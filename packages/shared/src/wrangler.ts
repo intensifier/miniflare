@@ -25,6 +25,11 @@ export interface WranglerEnvironmentConfig {
     id?: string;
     preview_id?: string;
   }[]; // NOT inherited
+  d1_databases?: {
+    binding: string;
+    database_name: string;
+    database_id: string;
+  }[]; // NOT inherited
   site?: {
     bucket: string;
     "entry-point"?: string;
@@ -54,6 +59,7 @@ export interface WranglerEnvironmentConfig {
     watch?: boolean;
     build_watch_dirs?: string[];
     kv_persist?: boolean | string;
+    d1_persist?: boolean | string;
     cache?: boolean;
     cache_persist?: boolean | string;
     durable_objects_persist?: boolean | string;

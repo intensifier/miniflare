@@ -1,3 +1,5 @@
+import path from "node:path";
+import type { Database } from "better-sqlite3";
 import { Awaitable } from "./sync";
 
 export interface StoredMeta<Meta = unknown> {
@@ -77,6 +79,9 @@ export abstract class Storage {
     options: StorageListOptions,
     skipMetadata: true
   ): Awaitable<StorageListResult<StoredKey>>;
+  getSqliteDatabase(): Database {
+    throw new Error("D1 not implemented for this Storage class");
+  }
 
   // Implementations (e.g. storage-file) may override this for efficient range requests
   async getRangeMaybeExpired?<Meta = unknown>(
@@ -128,4 +133,11 @@ export abstract class Storage {
 export interface StorageFactory {
   storage(namespace: string, persist?: boolean | string): Awaitable<Storage>;
   dispose?(): Awaitable<void>;
+}
+
+export function getSQLiteNativeBindingLocation() {
+  return path.resolve(
+    path.dirname(require.resolve("better-sqlite3")),
+    "../build/Release/better_sqlite3.node"
+  );
 }

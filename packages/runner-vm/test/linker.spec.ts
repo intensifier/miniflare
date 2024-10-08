@@ -4,6 +4,7 @@ import path from "path";
 import { TextDecoder } from "util";
 import { VMScriptRunner, VMScriptRunnerError } from "@miniflare/runner-vm";
 import {
+  Compatibility,
   Context,
   ModuleRule,
   ProcessedModuleRule,
@@ -35,9 +36,16 @@ const processedModuleRules = moduleRules.map<ProcessedModuleRule>((rule) => ({
 
 async function run(
   code: string,
-  globalScope: Context = {}
+  globalScope: Context = {},
+  compat?: Compatibility
 ): Promise<ScriptRunnerResult> {
-  return runner.run(globalScope, { code, filePath }, processedModuleRules);
+  return runner.run(
+    globalScope,
+    { code, filePath },
+    processedModuleRules,
+    undefined,
+    compat
+  );
 }
 
 test("ModuleLinker: links ESModule module via ES module", async (t) => {
@@ -280,3 +288,67 @@ test(
   sizeEntryDiamondPath,
   sizeEntryDiamond + sizeA + sizeB + sizeShared
 );
+
+test("ModuleLinker: permits dynamic import in entrypoint", async (t) => {
+  const result = await run(
+    `
+    export default async function() {
+      return (await import("./esmodule.mjs")).default;
+    }
+    `
+  );
+  t.is(await result.exports.default(), "ESModule test");
+});
+test("ModuleLinker: permits dynamic import in ES module", async (t) => {
+  const result = await run(`import f from "./dynamic.mjs"; export default f;`);
+  t.is((await result.exports.default()).trimEnd(), "Text test");
+});
+test("ModuleLinker: permits dynamic import of statically linked module", async (t) => {
+  const result = await run(
+    `
+    import staticValue from "./esmodule.mjs";
+    export default async function() {
+      const module = await import("./esmodule.mjs");
+      return { static: staticValue, dynamic: module.default };
+    }
+    `
+  );
+  t.deepEqual(await result.exports.default(), {
+    static: "ESModule test",
+    dynamic: "ESModule test",
+  });
+});
+
+test("ModuleLinker: respects export_commonjs_namespace compatibility flag", async (t) => {
+  let compat = new Compatibility(undefined, ["export_commonjs_default"]);
+  let result = await run(
+    `
+    import ns from "./cjsnamespace.cjs";
+    export default function() {
+      return ns;
+    }  
+    `,
+    undefined,
+    compat
+  );
+  let exports = await result.exports.default()();
+  t.is(exports.cjs, "CommonJS test");
+  t.is(exports.txt.trimEnd(), "Text test");
+  t.is(exports.txt, exports.txt2);
+
+  compat = new Compatibility(undefined, ["export_commonjs_namespace"]);
+  result = await run(
+    `
+    import ns from "./cjsnamespace.cjs";
+    export default function() {
+      return ns;
+    }  
+    `,
+    undefined,
+    compat
+  );
+  exports = await result.exports.default()();
+  t.is(exports.cjs.default, "CommonJS test");
+  t.is(exports.txt.default.trimEnd(), "Text test");
+  t.is(exports.txt, exports.txt2);
+});

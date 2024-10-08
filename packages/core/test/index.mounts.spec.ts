@@ -11,11 +11,18 @@ import {
   MiniflareCore,
   MiniflareCoreContext,
   MiniflareCoreError,
+  MiniflareCoreOptions,
   ReloadEvent,
 } from "@miniflare/core";
 import { DurableObjectsPlugin } from "@miniflare/durable-objects";
 import { HTTPPlugin, createServer } from "@miniflare/http-server";
 import { KVPlugin } from "@miniflare/kv";
+import {
+  MessageBatch,
+  QueueBroker,
+  QueueError,
+  QueuesPlugin,
+} from "@miniflare/queues";
 import { VMScriptRunner } from "@miniflare/runner-vm";
 import { LogLevel, NoOpLog, StoredValueMeta } from "@miniflare/shared";
 import {
@@ -23,6 +30,7 @@ import {
   MemoryStorageFactory,
   TestLog,
   TestPlugin,
+  triggerPromise,
   useMiniflare,
   useTmp,
   waitForReload,
@@ -248,6 +256,7 @@ test("MiniflareCore: #init: doesn't throw if script required, parent script not 
     storageFactory: new MemoryStorageFactory(),
     scriptRunner: new VMScriptRunner(),
     scriptRequired: true,
+    queueBroker: new QueueBroker(),
   };
 
   const mf = new MiniflareCore({ CorePlugin }, ctx, {
@@ -262,6 +271,7 @@ test("MiniflareCore: #init: logs reload errors when mount options update instead
     log,
     storageFactory: new MemoryStorageFactory(),
     scriptRunner: new VMScriptRunner(),
+    queueBroker: new QueueBroker(),
   };
   const mf = new MiniflareCore({ CorePlugin, DurableObjectsPlugin }, ctx, {
     mounts: { a: { script: "//" } },
@@ -523,6 +533,61 @@ test("MiniflareCore: dispatches scheduled event to mount", async (t) => {
   t.deepEqual(waitUntil, ["mount", 1000, "* * * * *"]);
 });
 
+test("MiniflareCore: consumes queue in mount", async (t) => {
+  const opts: MiniflareCoreOptions<{
+    CorePlugin: typeof CorePlugin;
+    BindingsPlugin: typeof BindingsPlugin;
+    QueuesPlugin: typeof QueuesPlugin;
+  }> = {
+    queueBindings: [{ name: "QUEUE", queueName: "queue" }],
+    modules: true,
+    script: `export default {
+      async fetch(request, env, ctx) {
+        env.QUEUE.send("message");
+        return new Response();
+      }
+    }`,
+    mounts: {
+      a: {
+        bindings: {
+          REPORTER(batch: MessageBatch) {
+            trigger(batch);
+          },
+        },
+        queueConsumers: [{ queueName: "queue", maxWaitMs: 0 }],
+        modules: true,
+        script: `export default {
+          queue(batch, env, ctx) {
+            env.REPORTER(batch);
+          }
+        }`,
+      },
+    },
+  };
+
+  // Check consumes messages sent in different mount
+  let [trigger, promise] = triggerPromise<MessageBatch>();
+  const mf = useMiniflare({ BindingsPlugin, QueuesPlugin }, opts);
+  await mf.dispatchFetch("http://localhost");
+  let batch = await promise;
+  t.is(batch.messages.length, 1);
+  t.is(batch.messages[0].body, "message");
+  // ...even after reload (https://github.com/cloudflare/miniflare/issues/560)
+  await mf.reload();
+  [trigger, promise] = triggerPromise<MessageBatch>();
+  await mf.dispatchFetch("http://localhost");
+  batch = await promise;
+  t.is(batch.messages.length, 1);
+  t.is(batch.messages[0].body, "message");
+
+  // Check queue can have at most one consumer
+  opts.queueConsumers = ["queue"]; // (adding parent as consumer too)
+  await t.throwsAsync(mf.setOptions(opts), {
+    instanceOf: QueueError,
+    code: "ERR_CONSUMER_ALREADY_SET",
+  });
+});
+
 // Shared storage persistence tests
 type PersistOptions = Pick<
   MiniflareOptions,
@@ -780,6 +845,7 @@ test("MiniflareCore: runs mounted worker script for Durable Object classes used 
       storageFactory: new MemoryStorageFactory(),
       scriptRunner: new VMScriptRunner(),
       scriptRunForModuleExports: true,
+      queueBroker: new QueueBroker(),
     },
     {
       modules: true,
@@ -823,6 +889,7 @@ test("MiniflareCore: can access Durable Objects defined in parent or other mount
       log: new NoOpLog(),
       storageFactory: new MemoryStorageFactory(),
       scriptRunner: new VMScriptRunner(),
+      queueBroker: new QueueBroker(),
     },
     {
       name: "parent",
@@ -882,4 +949,77 @@ test("MiniflareCore: can access Durable Objects defined in parent or other mount
   //  setOptions in mounts shouldn't really be exposed to end-users, it's only
   //  meant for testing.
   t.is(await res.text(), "parent object 2:mount a object");
+});
+test("MiniflareCore: reuses same instances across mounts", async (t) => {
+  // https://github.com/cloudflare/miniflare/issues/461
+
+  const script = (name: string) => `export class ${name}Object {
+    uuid = crypto.randomUUID();
+    fetch() {
+      return new Response("from ${name}: " + this.uuid);
+    }
+  }
+  export default {
+    async fetch(request, env) {
+      const name = new URL(request.url).pathname.substring(1);
+      const OBJECT = env[name];
+      const id = OBJECT.idFromName("fixed");
+      const stub = OBJECT.get(id);
+      const res = await stub.fetch(request);
+      const text = await res.text();
+      return new Response("via ${name}: " + text);
+    }
+  }`;
+
+  const mf = useMiniflare(
+    { DurableObjectsPlugin },
+    {
+      name: "parent",
+      modules: true,
+      script: script("Parent"),
+      durableObjects: {
+        PARENT_OBJECT: { className: "ParentObject" },
+        MOUNT_OBJECT: { className: "MountObject", scriptName: "mount" },
+      },
+      mounts: {
+        mount: {
+          name: "mount",
+          modules: true,
+          script: script("Mount"),
+          durableObjects: {
+            PARENT_OBJECT: { className: "ParentObject", scriptName: "parent" },
+            MOUNT_OBJECT: { className: "MountObject" },
+          },
+          routes: ["http://mount.mf/*"],
+        },
+      },
+    }
+  );
+
+  const uuidRegexp =
+    /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  const extractUuid = (text: string) =>
+    text.substring(text.lastIndexOf(":") + 2);
+
+  // First access objects from parent...
+  let res = await mf.dispatchFetch("http://localhost/PARENT_OBJECT");
+  let text = await res.text();
+  const parentUuid = extractUuid(text);
+  t.regex(parentUuid, uuidRegexp);
+  t.is(text, `via Parent: from Parent: ${parentUuid}`);
+
+  res = await mf.dispatchFetch("http://localhost/MOUNT_OBJECT");
+  text = await res.text();
+  const mountUuid = extractUuid(text);
+  t.regex(mountUuid, uuidRegexp);
+  t.not(mountUuid, parentUuid);
+  t.is(text, `via Parent: from Mount: ${mountUuid}`);
+
+  // ...then access those same objects from a different mount, checking the
+  // same instances are used.
+  res = await mf.dispatchFetch("http://mount.mf/PARENT_OBJECT");
+  t.is(await res.text(), `via Mount: from Parent: ${parentUuid}`);
+
+  res = await mf.dispatchFetch("http://mount.mf/MOUNT_OBJECT");
+  t.is(await res.text(), `via Mount: from Mount: ${mountUuid}`);
 });

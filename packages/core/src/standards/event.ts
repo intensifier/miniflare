@@ -2,10 +2,10 @@ import {
   Awaitable,
   Context,
   Log,
+  MessageBatch,
   MiniflareError,
   ThrowingEventTarget,
   TypedEventListener,
-  ValueOf,
   prefixError,
 } from "@miniflare/shared";
 import { Response as BaseResponse } from "undici";
@@ -32,9 +32,24 @@ const SUGGEST_GLOBAL_BINDING_MODULES =
   "handlers/Durable Object constructors, or `context.env` with " +
   "Pages Functions.";
 
+// Like `Promise.all()`, but also handles nested changes to the promises array
+export async function waitUntilAll<WaitUntil extends any[] = unknown[]>(
+  promises: Promise<unknown>[]
+): Promise<WaitUntil> {
+  let len = 0;
+  let last: WaitUntil = [] as unknown as WaitUntil;
+  // When the length of the array changes, there has been a nested call to
+  // `waitUntil` and we should await the promises again
+  while (len !== promises.length) {
+    len = promises.length;
+    last = (await Promise.all(promises)) as WaitUntil;
+  }
+  return last;
+}
+
 const kResponse = Symbol("kResponse");
 const kPassThrough = Symbol("kPassThrough");
-const kWaitUntil = Symbol("kWaitUntil");
+export const kWaitUntil = Symbol("kWaitUntil");
 const kSent = Symbol("kSent");
 
 export class FetchEvent extends Event {
@@ -107,10 +122,27 @@ export class ScheduledEvent extends Event {
   }
 }
 
-export class ExecutionContext {
-  readonly #event: FetchEvent | ScheduledEvent;
+export class QueueEvent extends Event {
+  readonly batch: MessageBatch;
+  readonly [kWaitUntil]: Promise<unknown>[] = [];
 
-  constructor(event: FetchEvent | ScheduledEvent) {
+  constructor(type: "queue", init: { batch: MessageBatch }) {
+    super(type);
+    this.batch = init.batch;
+  }
+
+  waitUntil(promise: Promise<any>): void {
+    if (!(this instanceof QueueEvent)) {
+      throw new TypeError("Illegal invocation");
+    }
+    this[kWaitUntil].push(promise);
+  }
+}
+
+export class ExecutionContext {
+  readonly #event: FetchEvent | ScheduledEvent | QueueEvent;
+
+  constructor(event: FetchEvent | ScheduledEvent | QueueEvent) {
     this.#event = event;
   }
 
@@ -148,12 +180,20 @@ export type ModuleScheduledListener = (
   ctx: ExecutionContext
 ) => any;
 
+export type ModuleQueueListener = (
+  batch: MessageBatch,
+  env: Context,
+  ctx: ExecutionContext
+) => any;
+
 export const kAddModuleFetchListener = Symbol("kAddModuleFetchListener");
 export const kAddModuleScheduledListener = Symbol(
   "kAddModuleScheduledListener"
 );
+export const kAddModuleQueueListener = Symbol("kAddModuleQueueListener");
 export const kDispatchFetch = Symbol("kDispatchFetch");
 export const kDispatchScheduled = Symbol("kDispatchScheduled");
+export const kDispatchQueue = Symbol("kDispatchQueue");
 export const kDispose = Symbol("kDispose");
 
 export class PromiseRejectionEvent extends Event {
@@ -173,9 +213,19 @@ export class PromiseRejectionEvent extends Event {
 export type WorkerGlobalScopeEventMap = {
   fetch: FetchEvent;
   scheduled: ScheduledEvent;
+  queue: QueueEvent;
   unhandledrejection: PromiseRejectionEvent;
   rejectionhandled: PromiseRejectionEvent;
 };
+
+function isSpecialEventType(type: string) {
+  return (
+    type === "fetch" ||
+    type === "scheduled" ||
+    type === "trace" ||
+    type === "queue"
+  );
+}
 
 export class WorkerGlobalScope extends ThrowingEventTarget<WorkerGlobalScopeEventMap> {}
 
@@ -269,10 +319,9 @@ export class ServiceWorkerGlobalScope extends WorkerGlobalScope {
     listener: TypedEventListener<WorkerGlobalScopeEventMap[Type]> | null,
     options?: AddEventListenerOptions | boolean
   ): void => {
-    if (this.#modules) {
-      throw new TypeError(
-        "Global addEventListener() cannot be used in modules. Instead, event " +
-          "handlers should be declared as exports on the root module."
+    if (this.#modules && isSpecialEventType(type)) {
+      return this.#log.warn(
+        `When using module syntax, the '${type}' event handler should be declared as an exported function on the root module as opposed to using the global addEventListener().`
       );
     }
 
@@ -295,12 +344,7 @@ export class ServiceWorkerGlobalScope extends WorkerGlobalScope {
     listener: TypedEventListener<WorkerGlobalScopeEventMap[Type]> | null,
     options?: EventListenerOptions | boolean
   ): void => {
-    if (this.#modules) {
-      throw new TypeError(
-        "Global removeEventListener() cannot be used in modules. Instead, event " +
-          "handlers should be declared as exports on the root module."
-      );
-    }
+    if (this.#modules && isSpecialEventType(type)) return;
 
     // Unregister process wide rejectionHandled/unhandledRejection listeners if
     // no longer needed and not already done so
@@ -312,16 +356,6 @@ export class ServiceWorkerGlobalScope extends WorkerGlobalScope {
     }
 
     super.removeEventListener(type, listener, options);
-  };
-
-  dispatchEvent = (event: ValueOf<WorkerGlobalScopeEventMap>): boolean => {
-    if (this.#modules) {
-      throw new TypeError(
-        "Global dispatchEvent() cannot be used in modules. Instead, event " +
-          "handlers should be declared as exports on the root module."
-      );
-    }
-    return super.dispatchEvent(event);
   };
 
   [kAddModuleFetchListener](listener: ModuleFetchListener): void {
@@ -338,6 +372,13 @@ export class ServiceWorkerGlobalScope extends WorkerGlobalScope {
       const controller = new ScheduledController(e.scheduledTime, e.cron);
       const ctx = new ExecutionContext(e);
       const res = listener(controller, this.#bindings, ctx);
+      if (res !== undefined) e.waitUntil(Promise.resolve(res));
+    });
+  }
+
+  [kAddModuleQueueListener](listener: ModuleQueueListener): void {
+    super.addEventListener("queue", (e) => {
+      const res = listener(e.batch, this.#bindings, new ExecutionContext(e));
       if (res !== undefined) e.waitUntil(Promise.resolve(res));
     });
   }
@@ -378,7 +419,7 @@ export class ServiceWorkerGlobalScope extends WorkerGlobalScope {
       }
 
       // noinspection ES6MissingAwait
-      const waitUntil = Promise.all(event[kWaitUntil]) as Promise<WaitUntil>;
+      const waitUntil = waitUntilAll<WaitUntil>(event[kWaitUntil]);
       return withWaitUntil(res, waitUntil);
     }
 
@@ -410,7 +451,7 @@ export class ServiceWorkerGlobalScope extends WorkerGlobalScope {
     }
 
     // noinspection ES6MissingAwait
-    const waitUntil = Promise.all(event[kWaitUntil]) as Promise<WaitUntil>;
+    const waitUntil = waitUntilAll<WaitUntil>(event[kWaitUntil]);
     return withWaitUntil(await fetch(request), waitUntil);
   }
 
@@ -423,7 +464,15 @@ export class ServiceWorkerGlobalScope extends WorkerGlobalScope {
       cron: cron ?? "",
     });
     super.dispatchEvent(event);
-    return (await Promise.all(event[kWaitUntil])) as WaitUntil;
+    return waitUntilAll<WaitUntil>(event[kWaitUntil]);
+  }
+
+  async [kDispatchQueue]<WaitUntil extends any[] = any[]>(
+    batch: MessageBatch
+  ): Promise<WaitUntil> {
+    const event = new QueueEvent("queue", { batch });
+    super.dispatchEvent(event);
+    return waitUntilAll<WaitUntil>(event[kWaitUntil]);
   }
 
   // eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types

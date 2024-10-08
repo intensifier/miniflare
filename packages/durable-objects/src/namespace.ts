@@ -30,6 +30,13 @@ function hexEncode(value: Uint8Array): string {
     .join("");
 }
 
+function checkJurisdiction(jurisdiction?: string): boolean {
+  const allowedJurisdictions = ["eu", "fedramp"];
+  return (
+    jurisdiction === undefined || allowedJurisdictions.includes(jurisdiction)
+  );
+}
+
 export const kObjectName = Symbol("kObjectName");
 
 export class DurableObjectId {
@@ -62,6 +69,8 @@ export interface DurableObject {
 }
 
 export const kInstance = Symbol("kInstance");
+/** @internal */
+export const _kRunWithGates = Symbol("kRunWithGates");
 export const kAlarm = Symbol("kAlarm");
 const kFetch = Symbol("kFetch");
 
@@ -81,41 +90,40 @@ export class DurableObjectState {
     return this.#inputGate.runWithClosed(closure);
   }
 
-  [kFetch](request: Request): Promise<Response> {
+  /** @internal */
+  [_kRunWithGates]<T>(closure: () => Awaitable<T>): Promise<T> {
     // TODO: catch, reset object on error
     const outputGate = new OutputGate();
-    return outputGate.runWith(() =>
-      this.#inputGate.runWith(() => {
-        const instance = this[kInstance];
-        if (!instance?.fetch) {
-          throw new DurableObjectError(
-            "ERR_NO_HANDLER",
-            "No fetch handler defined in Durable Object"
-          );
-        }
-        return instance.fetch(request);
-      })
-    );
+    return outputGate.runWith(() => this.#inputGate.runWith(closure));
+  }
+
+  [kFetch](request: Request): Promise<Response> {
+    return this[_kRunWithGates](() => {
+      const instance = this[kInstance];
+      if (!instance?.fetch) {
+        throw new DurableObjectError(
+          "ERR_NO_HANDLER",
+          "No fetch handler defined in Durable Object"
+        );
+      }
+      return instance.fetch(request);
+    });
   }
 
   [kAlarm](): Promise<void> {
-    // TODO: catch, reset object on error
-    const outputGate = new OutputGate();
-    return outputGate.runWith(() =>
-      this.#inputGate.runWith(() => {
-        // delete the local alarm
-        this.storage.deleteAlarm();
-        // grab the instance and call the alarm handler
-        const instance = this[kInstance];
-        if (!instance?.alarm) {
-          throw new DurableObjectError(
-            "ERR_NO_HANDLER",
-            "No alarm handler defined in Durable Object"
-          );
-        }
-        return instance.alarm();
-      })
-    );
+    return this[_kRunWithGates](async () => {
+      // Delete the local alarm
+      await this.storage.deleteAlarm();
+      // Grab the instance and call the alarm handler
+      const instance = this[kInstance];
+      if (!instance?.alarm) {
+        throw new DurableObjectError(
+          "ERR_NO_HANDLER",
+          "No alarm handler defined in Durable Object"
+        );
+      }
+      return instance.alarm();
+    });
   }
 }
 
@@ -193,7 +201,7 @@ export class DurableObjectStub {
       );
     }
 
-    return res;
+    return withImmutableHeaders(res);
   }
 }
 
@@ -201,7 +209,7 @@ export interface NewUniqueIdOptions {
   jurisdiction?: string; // Ignored
 }
 
-const HEX_ID_REGEXP = /^[A-Za-z0-9]{64}$/; // 64 hex digits
+const HEX_ID_REGEXP = /^[A-Fa-f0-9]{64}$/; // 64 hex digits
 
 export class DurableObjectNamespace {
   readonly #objectName: string;
@@ -229,7 +237,23 @@ export class DurableObjectNamespace {
     this.#ctx = ctx;
   }
 
-  newUniqueId(_options?: NewUniqueIdOptions): DurableObjectId {
+  jurisdiction(name: string): DurableObjectNamespace {
+    if (!checkJurisdiction(name)) {
+      throw new TypeError(
+        `jurisdiction called with an unsupported jurisdiction: "${name}"`
+      );
+    }
+    // Ignore jurisdiction restrictions in local mode
+    return this;
+  }
+
+  newUniqueId(options?: NewUniqueIdOptions): DurableObjectId {
+    if (!checkJurisdiction(options?.jurisdiction)) {
+      throw new TypeError(
+        `newUniqueId called with an unsupported jurisdiction: "${options?.jurisdiction}"`
+      );
+    }
+
     // Create new zero-filled 32 byte buffer
     const id = new Uint8Array(32);
     // Leave first byte as 0, ensuring no intersection with named IDs

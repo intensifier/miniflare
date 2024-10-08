@@ -63,6 +63,8 @@ const buildOptions = {
     "jest*",
     // Mark sites manifest as external, it's added by SitesPlugin
     "__STATIC_CONTENT_MANIFEST",
+    // SQLite requires a better_sqlite3.node file, so don't bundle it
+    "better-sqlite3",
   ],
   logLevel: watch ? "info" : "warning",
   watch,
@@ -90,7 +92,7 @@ async function buildPackage(name) {
   }
   const outPath = path.join(pkgRoot, "dist");
 
-  const cjsEntryPoints = [indexPath, ...testPaths];
+  const cjsEntryPoints = [...testPaths];
   // Some tests require bundled ES module fixtures (e.g. Workers Sites), so
   // build .mjs/.mts files using `format: "esm"`
   const esmEntryPoints = [];
@@ -98,6 +100,13 @@ async function buildPackage(name) {
     (/\.m[tj]s$/.test(entryPoint) ? esmEntryPoints : cjsEntryPoints).push(
       path.join(pkgRoot, entryPoint)
     );
+  }
+  // `vitest` requires custom environments to be ES modules with default exports
+  const isVitestEnvironment = name === "vitest-environment-miniflare";
+  if (isVitestEnvironment) {
+    esmEntryPoints.unshift(indexPath);
+  } else {
+    cjsEntryPoints.unshift(indexPath);
   }
 
   const pkgBuildOptions = {
@@ -112,7 +121,11 @@ async function buildPackage(name) {
     outdir: outPath,
     outbase: pkgRoot,
   };
-  await esbuild.build({ ...pkgBuildOptions, entryPoints: cjsEntryPoints });
+  await esbuild.build({
+    ...pkgBuildOptions,
+    entryPoints: cjsEntryPoints,
+    outExtension: isVitestEnvironment ? { ".js": ".cjs" } : undefined,
+  });
   if (esmEntryPoints.length) {
     await esbuild.build({
       ...pkgBuildOptions,

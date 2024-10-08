@@ -9,10 +9,9 @@ order: 4
 
 ## Server
 
-When using the CLI, or the `createServer` method, Miniflare will always upgrade
-Web Socket connections. The worker must then respond with a status
-`101 Switching Protocols` response including a `webSocket`. For example, the
-worker below implements an echo WebSocket server:
+Miniflare will always upgrade Web Socket connections. The worker must respond
+with a status `101 Switching Protocols` response including a `webSocket`. For
+example, the worker below implements an echo WebSocket server:
 
 ```js
 export default {
@@ -38,7 +37,7 @@ script was stored in `echo.mjs`:
 
 ```js
 ---
-highlight: [9,10,11,12,13,14,15]
+highlight: [11,12,13,14,15]
 ---
 import { Miniflare } from "miniflare";
 
@@ -46,6 +45,7 @@ const mf = new Miniflare({
   modules: true,
   scriptPath: "echo.mjs",
 });
+
 const res = await mf.dispatchFetch();
 
 const webSocket = res.webSocket;
@@ -59,7 +59,9 @@ webSocket.send("Hello!"); // Above listener logs "Hello!"
 
 ## Client
 
-Miniflare also supports using workers as WebSocket clients too via `fetch`:
+Miniflare also supports using workers as WebSocket clients too via `fetch` or
+the
+[standard `new WebSocket()` constructor](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/WebSocket):
 
 ```js
 ---
@@ -92,13 +94,8 @@ Like the real Workers runtime, Miniflare will throw errors when:
 
 - Attempting to use a `WebSocket` in a `Response` that has already been used
 - Attempting to use a `WebSocket` in a `Response` after calling `accept()` on it
-- Attempting to construct a `WebSocket` using the `WebSocket` constructor
 - Attempting to call `WebSocket#send()` or `WebSocket#close()` without first
   calling `accept()`
 - Attempting to call `WebSocket#send()` after calling `close()`
 - Attempting to call `WebSocket#close()` on an already closed WebSocket
 - Attempting to call `WebSocket#close()` with an invalid close code
-
-Note Miniflare intentionally doesn't support the `WebSocket#readyState`
-property, or the `open` event, as these aren't yet supported by the real Workers
-runtime.

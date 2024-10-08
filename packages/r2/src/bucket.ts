@@ -1,22 +1,40 @@
+// noinspection SuspiciousTypeOfGuard
+
 import { Blob } from "buffer";
+import crypto from "crypto";
 import { arrayBuffer } from "stream/consumers";
 import { ReadableStream } from "stream/web";
 import { TextEncoder } from "util";
+import { parseRanges } from "@miniflare/core";
 import {
-  RangeStoredValueMeta,
   RequestContext,
   Storage,
   assertInRequest,
   getRequestContext,
+  parseRange,
   viewToArray,
   waitForOpenInputGate,
   waitForOpenOutputGate,
 } from "@miniflare/shared";
 import { Headers } from "undici";
 import {
+  InternalR2MultipartUploadOptions,
+  R2MultipartUpload,
+  _INTERNAL_PREFIX,
+  createMultipartUpload,
+  deleteMultipartParts,
+  getMultipartValue,
+  validateMultipartKey,
+} from "./multipart";
+import {
+  HEX_REGEXP,
+  MAX_KEY_SIZE,
+  R2Checksums,
+  R2HashAlgorithm,
   R2Object,
   R2ObjectBody,
-  createHash,
+  R2_HASH_ALGORITHMS,
+  createMD5Hash,
   createVersion,
   parseHttpMetadata,
   parseOnlyIf,
@@ -50,7 +68,7 @@ export interface R2GetOptions {
   // Specifies that only a specific length (from an optional offset) or suffix
   // of bytes from the object should be returned. Refer to
   // https://developers.cloudflare.com/r2/runtime-apis/#ranged-reads.
-  range?: R2Range;
+  range?: R2Range | Headers;
 }
 
 export type R2PutValueType =
@@ -60,7 +78,7 @@ export type R2PutValueType =
   | string
   | null
   | Blob;
-export interface R2PutOptions {
+export interface R2PutOptions extends R2Checksums<ArrayBuffer | string> {
   // Specifies that the object should only be stored given satisfaction of
   // certain conditions in the R2Conditional. Refer to R2Conditional above.
   onlyIf?: R2Conditional | Headers;
@@ -69,9 +87,11 @@ export interface R2PutOptions {
   httpMetadata?: R2HTTPMetadata | Headers;
   // A map of custom, user-defined metadata that will be stored with the object.
   customMetadata?: Record<string, string>;
-  // A md5 hash to use to check the recieved object’s integrity.
-  md5?: ArrayBuffer | string;
 }
+export type R2MultipartOptions = Pick<
+  R2PutOptions,
+  "httpMetadata" | "customMetadata"
+>;
 
 export type R2ListOptionsInclude = ("httpMetadata" | "customMetadata")[];
 
@@ -113,7 +133,6 @@ export interface R2Objects {
 }
 
 const MAX_LIST_KEYS = 1_000;
-const MAX_KEY_SIZE = 1024;
 // https://developers.cloudflare.com/r2/platform/limits/ (5GB - 5MB)
 const MAX_VALUE_SIZE = 5 * 1_000 * 1_000 * 1_000 - 5 * 1_000 * 1_000;
 const UNPAIRED_SURROGATE_PAIR_REGEX =
@@ -123,11 +142,11 @@ const encoder = new TextEncoder();
 
 type Method = "HEAD" | "GET" | "PUT" | "LIST" | "DELETE";
 
-function throwR2Error(method: Method, status: number, message: string): void {
+function throwR2Error(method: Method, status: number, message: string): never {
   throw new Error(`R2 ${method} failed: (${status}) ${message}`);
 }
 
-function validateKey(method: Method, key: string): void {
+function validateKey(method: Method, key: string) {
   // Check key isn't too long and exists outside regex
   const keyLength = encoder.encode(key).byteLength;
   if (UNPAIRED_SURROGATE_PAIR_REGEX.test(key)) {
@@ -140,6 +159,11 @@ function validateKey(method: Method, key: string): void {
       `UTF-8 encoded length of ${keyLength} exceeds key length limit of ${MAX_KEY_SIZE}.`
     );
   }
+  // Check key doesn't start with internal prefix used for multipart storage
+  if (key.startsWith(_INTERNAL_PREFIX)) {
+    throwR2Error(method, 400, `Key cannot start with "${_INTERNAL_PREFIX}".`);
+  }
+  return key;
 }
 
 function validateOnlyIf(
@@ -186,8 +210,11 @@ function validateGetOptions(options: R2GetOptions): void {
   if (typeof range !== "object") {
     throwR2Error("GET", 400, "range must either be an object or undefined.");
   }
-  const { offset, length, suffix } = range;
 
+  // Validate range if not `Range` header, that will be validated once we've
+  // fetched metadata containing the size
+  if (range instanceof Headers) return;
+  const { offset, length, suffix } = range;
   if (offset !== undefined) {
     if (typeof offset !== "number") {
       throwR2Error("GET", 400, "offset must either be a number or undefined.");
@@ -234,8 +261,65 @@ function validateHttpMetadata(httpMetadata?: R2HTTPMetadata | Headers): void {
   }
 }
 
-function validatePutOptions(options: R2PutOptions): void {
-  const { onlyIf = {}, httpMetadata, customMetadata, md5 } = options;
+interface R2PutOptionHash {
+  alg: R2HashAlgorithm;
+  hash: Buffer;
+}
+function validatePutHash(
+  options: R2PutOptions,
+  alg: R2HashAlgorithm
+): R2PutOptionHash | undefined {
+  const hash = options[alg.field];
+  let buffer: Buffer;
+  if (hash === undefined) {
+    return;
+  } else if (hash instanceof ArrayBuffer) {
+    buffer = Buffer.from(hash);
+  } else if (ArrayBuffer.isView(hash)) {
+    // Note `ArrayBufferView`s are automatically coerced to `ArrayBuffer`'s by
+    // the runtime.
+    buffer = Buffer.from(viewToArray(hash));
+  } else if (typeof hash === "string") {
+    const expectedHex = alg.expectedBytes * 2;
+    if (hash.length !== expectedHex) {
+      throw new TypeError(
+        `${alg.name} is ${expectedHex} hex characters, not ${hash.length}`
+      );
+    }
+    if (!HEX_REGEXP.test(hash)) {
+      throw new TypeError(`Provided ${alg.name} wasn't a valid hex string`);
+    }
+    buffer = Buffer.from(hash, "hex");
+  } else {
+    throw new TypeError(
+      `Incorrect type for the '${alg.field}' field on 'PutOptions': the provided value is not of type 'ArrayBuffer or ArrayBufferView or string'.`
+    );
+  }
+  if (buffer.byteLength !== alg.expectedBytes) {
+    throw new TypeError(
+      `${alg.name} is ${alg.expectedBytes} bytes, not ${buffer.byteLength}`
+    );
+  }
+  return { alg, hash: buffer };
+}
+function validatePutHashes(options: R2PutOptions): R2PutOptionHash | undefined {
+  let hash: R2PutOptionHash | undefined;
+  for (const alg of R2_HASH_ALGORITHMS) {
+    const validatedHash = validatePutHash(options, alg);
+    if (validatedHash !== undefined) {
+      if (hash !== undefined) {
+        throw new TypeError("You cannot specify multiple hashing algorithms.");
+      }
+      hash = validatedHash;
+    }
+  }
+  return hash;
+}
+
+function validatePutOptions(
+  options: R2PutOptions
+): R2PutOptionHash | undefined {
+  const { onlyIf = {}, httpMetadata, customMetadata } = options;
 
   validateOnlyIf(onlyIf, "PUT");
   validateHttpMetadata(httpMetadata);
@@ -255,17 +339,7 @@ function validatePutOptions(options: R2PutOptions): void {
     }
   }
 
-  if (
-    md5 !== undefined &&
-    !(md5 instanceof ArrayBuffer) &&
-    typeof md5 !== "string"
-  ) {
-    throwR2Error(
-      "PUT",
-      400,
-      "md5 must be a string, ArrayBuffer, or undefined."
-    );
-  }
+  return validatePutHashes(options);
 }
 
 function validateListOptions(options: R2ListOptions): void {
@@ -335,57 +409,90 @@ export async function _valueToArray(
   }
 }
 
+function rangeHeaderToR2Range(headers: Headers, size: number): R2Range {
+  const rangeHeader = headers.get("Range");
+  if (rangeHeader !== null) {
+    const ranges = parseRanges(rangeHeader, size);
+    if (ranges?.length === 1) {
+      // If the header contained a single range, convert it to an R2Range.
+      // Note `start` and `end` are inclusive.
+      const [start, end] = ranges[0];
+      return { offset: start, length: end - start + 1 };
+    }
+  }
+  // If the header didn't exist, was invalid, or contained multiple ranges,
+  // just return the full response
+  return {};
+}
+
+function buildKeyTypeError(method: keyof R2Bucket): string {
+  return `Failed to execute '${method}' on 'R2Bucket': parameter 1 is not of type 'string'.`;
+}
+
 export interface InternalR2BucketOptions {
   blockGlobalAsyncIO?: boolean;
+  listRespectInclude?: boolean;
+  minMultipartUploadSize?: number;
 }
 
 export class R2Bucket {
   readonly #storage: Storage;
   readonly #blockGlobalAsyncIO: boolean;
+  readonly #listRespectInclude: boolean;
+  readonly #multipartOpts: InternalR2MultipartUploadOptions;
 
   constructor(
     storage: Storage,
-    { blockGlobalAsyncIO = false }: InternalR2BucketOptions = {}
+    {
+      blockGlobalAsyncIO = false,
+      listRespectInclude = true,
+      minMultipartUploadSize,
+    }: InternalR2BucketOptions = {}
   ) {
     this.#storage = storage;
     this.#blockGlobalAsyncIO = blockGlobalAsyncIO;
+    this.#listRespectInclude = listRespectInclude;
+    this.#multipartOpts = {
+      storage,
+      blockGlobalAsyncIO,
+      minMultipartUploadSize,
+    };
   }
 
-  #prepareCtx(method: Method, key?: string): RequestContext | undefined {
+  #prepareCtx(): RequestContext | undefined {
     if (this.#blockGlobalAsyncIO) assertInRequest();
     const ctx = getRequestContext();
     ctx?.incrementInternalSubrequests();
-    // noinspection SuspiciousTypeOfGuard
-    if (method !== "LIST" && typeof key !== "string") {
-      throw new TypeError(
-        `Failed to execute '${method.toLowerCase()}'` +
-          " on 'R2Bucket': parameter 1 is not of type 'string'."
-      );
-    }
-
     return ctx;
   }
 
-  async #head(key: string, ctx?: RequestContext): Promise<R2Object | null> {
-    if (ctx === undefined) ctx = this.#prepareCtx("HEAD", key);
-
-    // Validate key
-    validateKey("HEAD", key);
-
+  async #head(key: string): Promise<R2ObjectMetadata | null> {
     // Get value, returning null if not found
     const stored = await this.#storage.head<R2ObjectMetadata>(key);
     // fix dates
-    await waitForOpenInputGate();
-    ctx?.advanceCurrentTime();
     if (stored?.metadata === undefined) return null;
     const { metadata } = stored;
     parseR2ObjectMetadata(metadata);
 
-    return new R2Object(metadata);
+    return metadata;
   }
 
   async head(key: string): Promise<R2Object | null> {
-    return this.#head(key);
+    const ctx = this.#prepareCtx();
+
+    // The Workers runtime will coerce the key parameter to a string
+    if (arguments.length === 0) {
+      throw new TypeError(buildKeyTypeError("head"));
+    }
+    key = String(key);
+    // Validate key
+    validateKey("HEAD", key);
+
+    const meta = await this.#head(key);
+    await waitForOpenInputGate();
+
+    ctx?.advanceCurrentTime();
+    return meta === null ? null : new R2Object(meta);
   }
 
   /**
@@ -400,10 +507,15 @@ export class R2Bucket {
     key: string,
     options?: R2GetOptions
   ): Promise<R2ObjectBody | R2Object | null> {
-    const ctx = this.#prepareCtx("GET", key);
+    const ctx = this.#prepareCtx();
     options = options ?? {};
-    const { range = {} } = options;
+    let { range = {} } = options;
 
+    // The Workers runtime will coerce the key parameter to a string
+    if (arguments.length === 0) {
+      throw new TypeError(buildKeyTypeError("get"));
+    }
+    key = String(key);
     // Validate key
     validateKey("GET", key);
     // Validate options
@@ -412,36 +524,58 @@ export class R2Bucket {
     // In the event that an onlyIf precondition fails, we return
     // the R2Object without the body. Otherwise return with body.
     const onlyIf = parseOnlyIf(options.onlyIf);
-    const meta = await this.#head(key, ctx);
+    const meta = await this.#head(key);
     // if bad metadata, return null
-    if (meta === null) return null;
+    if (meta === null) {
+      await waitForOpenInputGate();
+      ctx?.advanceCurrentTime();
+      return null;
+    }
     // test conditional should it exist
-    if (!testR2Conditional(onlyIf, meta) || meta?.size === 0) {
+    if (!testR2Conditional(onlyIf, meta)) {
+      await waitForOpenInputGate();
+      ctx?.advanceCurrentTime();
       return new R2Object(meta);
     }
 
-    let stored: RangeStoredValueMeta<R2ObjectMetadata> | undefined;
+    // Convert `Range` header to R2Range if specified
+    if (range instanceof Headers) {
+      range = rangeHeaderToR2Range(range, meta.size);
+    }
 
-    // get data dependent upon whether suffix or range exists
+    let value: Uint8Array | ReadableStream<Uint8Array>;
     try {
-      stored = await this.#storage.getRange<R2ObjectMetadata>(key, range);
+      if (meta.size === 0) {
+        value = new Uint8Array();
+      } else if (meta.multipart !== undefined) {
+        const parsedRange = parseRange(range, meta.size);
+        value = getMultipartValue(
+          this.#storage,
+          key,
+          meta.multipart,
+          parsedRange
+        );
+        meta.range = parsedRange;
+      } else {
+        const stored = await this.#storage.getRange<R2ObjectMetadata>(
+          key,
+          range
+        );
+        if (stored === undefined) return null;
+        value = stored.value;
+        // Add range should it exist
+        if ("range" in stored && stored.range !== undefined) {
+          meta.range = stored.range;
+        }
+      }
     } catch {
       throwR2Error("GET", 400, "The requested range is not satisfiable.");
     }
 
     await waitForOpenInputGate();
     ctx?.advanceCurrentTime();
-    // if bad metadata, return null
-    if (stored?.metadata === undefined) return null;
-    const { value, metadata } = stored;
-    // fix dates
-    parseR2ObjectMetadata(metadata);
-    // add range should it exist
-    if ("range" in stored && stored.range !== undefined) {
-      metadata.range = stored.range;
-    }
 
-    return new R2ObjectBody(metadata, value);
+    return new R2ObjectBody(meta, value);
   }
 
   async put(
@@ -449,19 +583,25 @@ export class R2Bucket {
     value: R2PutValueType,
     options: R2PutOptions = {}
   ): Promise<R2Object | null> {
-    const ctx = this.#prepareCtx("PUT", key);
+    const ctx = this.#prepareCtx();
+
+    // The Workers runtime will coerce the key parameter to a string
+    if (arguments.length === 0) {
+      throw new TypeError(buildKeyTypeError("put"));
+    }
+    key = String(key);
     // Validate key
     validateKey("PUT", key);
     // Validate options
-    validatePutOptions(options);
+    const specifiedHash = validatePutOptions(options);
 
     const { customMetadata = {} } = options;
-    let { md5, onlyIf, httpMetadata } = options;
+    let { onlyIf, httpMetadata } = options;
     onlyIf = parseOnlyIf(onlyIf);
     httpMetadata = parseHttpMetadata(httpMetadata);
 
     // Get meta, and if exists, run onlyIf condtional test
-    const meta = (await this.#head(key, ctx)) ?? undefined;
+    const meta = (await this.#head(key)) ?? undefined;
     if (!testR2Conditional(onlyIf, meta)) return null;
 
     // Convert value to Uint8Array
@@ -476,23 +616,25 @@ export class R2Bucket {
       );
     }
 
-    // if md5 is provided, check objects integrity
-    const md5Hash = createHash(toStore);
-    if (md5 !== undefined) {
-      // convert to string
-      if (md5 instanceof ArrayBuffer) {
-        md5 = Buffer.from(new Uint8Array(md5)).toString("hex");
-      }
-      if (md5 !== md5Hash) {
-        throwR2Error(
-          "PUT",
-          400,
-          "The Content-MD5 you specified did not match what we received."
+    // If hash is provided, check objects integrity
+    const checksums: R2Checksums<string> = {};
+    if (specifiedHash !== undefined) {
+      const computedHash = crypto
+        .createHash(specifiedHash.alg.field)
+        .update(toStore)
+        .digest();
+      if (!specifiedHash.hash.equals(computedHash)) {
+        throw new Error(
+          `put: The ${specifiedHash.alg.name} checksum you specified did not match what we received.`
         );
       }
+      // Store computed hash to ensure consistent casing in returned checksums
+      // from `R2Object`
+      checksums[specifiedHash.alg.field] = computedHash.toString("hex");
     }
 
-    // build metadata
+    // Build metadata
+    const md5Hash = createMD5Hash(toStore);
     const metadata: R2ObjectMetadata = {
       key,
       size: toStore.byteLength,
@@ -502,6 +644,7 @@ export class R2Bucket {
       uploaded: new Date(),
       httpMetadata,
       customMetadata,
+      checksums,
     };
 
     // Store value with expiration and metadata
@@ -510,24 +653,51 @@ export class R2Bucket {
       value: toStore,
       metadata,
     });
+    // If existing value was multipart, remove its parts
+    if (meta?.multipart !== undefined) {
+      await deleteMultipartParts(this.#storage, key, meta.multipart.uploadId);
+    }
     await waitForOpenInputGate();
     ctx?.advanceCurrentTime();
 
     return new R2Object(metadata);
   }
 
-  async delete(key: string): Promise<void> {
-    const ctx = this.#prepareCtx("DELETE", key);
+  async delete(keys: string | string[]): Promise<void> {
+    const ctx = this.#prepareCtx();
 
-    validateKey("DELETE", key);
+    // The Workers runtime will coerce keys to strings
+    if (arguments.length === 0) {
+      throw new TypeError(buildKeyTypeError("delete"));
+    }
+    if (!Array.isArray(keys)) keys = [keys];
+    keys = keys.map((key) => validateKey("DELETE", String(key)));
+
     await waitForOpenOutputGate();
-    await this.#storage.delete(key);
+    const keyMetas = await Promise.all(keys.map((key) => this.#head(key)));
+
+    await this.#storage.deleteMany(keys);
+
+    // If any existing values were multipart, remove their parts
+    const deletePartsPromises = keys.map((key, i) => {
+      const keyMeta = keyMetas[i];
+      if (keyMeta?.multipart !== undefined) {
+        return deleteMultipartParts(
+          this.#storage,
+          key,
+          keyMeta.multipart.uploadId
+        );
+      }
+    });
+    await Promise.all(deletePartsPromises);
+
     await waitForOpenInputGate();
+
     ctx?.advanceCurrentTime();
   }
 
   async list(listOptions: R2ListOptions = {}): Promise<R2Objects> {
-    const ctx = this.#prepareCtx("LIST");
+    const ctx = this.#prepareCtx();
     const delimitedPrefixes = new Set<string>();
 
     validateListOptions(listOptions);
@@ -545,6 +715,7 @@ export class R2Bucket {
 
     const res = await this.#storage.list<R2ObjectMetadata>({
       prefix,
+      excludePrefix: _INTERNAL_PREFIX,
       limit,
       cursor,
       start: startAfter,
@@ -562,8 +733,10 @@ export class R2Bucket {
       )
       // filter "httpMetadata" and/or "customMetadata" if found in "include"
       .map((metadata) => {
-        if (!include.includes("httpMetadata")) metadata.httpMetadata = {};
-        if (!include.includes("customMetadata")) metadata.customMetadata = {};
+        if (this.#listRespectInclude) {
+          if (!include.includes("httpMetadata")) metadata.httpMetadata = {};
+          if (!include.includes("customMetadata")) metadata.customMetadata = {};
+        }
         // fix dates
         parseR2ObjectMetadata(metadata);
 
@@ -590,5 +763,75 @@ export class R2Bucket {
       cursor: cursorLength ? res.cursor : undefined,
       delimitedPrefixes: [...delimitedPrefixes],
     };
+  }
+
+  async createMultipartUpload(
+    key: string,
+    options: R2MultipartOptions = {}
+  ): Promise<R2MultipartUpload> {
+    const ctx = this.#prepareCtx();
+
+    // The Workers runtime will coerce the key parameter to a string
+    if (arguments.length === 0) {
+      throw new TypeError(buildKeyTypeError("createMultipartUpload"));
+    }
+    key = String(key);
+    validateMultipartKey("createMultipartUpload", key);
+
+    // Validate options
+    if (typeof options !== "object") {
+      throw new TypeError(
+        "Failed to execute 'createMultipartUpload' on 'R2Bucket': parameter 2 is not of type 'MultipartOptions'."
+      );
+    }
+    if (
+      options.customMetadata !== undefined &&
+      typeof options.customMetadata !== "object"
+    ) {
+      throw new TypeError(
+        "Incorrect type for the 'customMetadata' field on 'MultipartOptions': the provided value is not of type 'object'."
+      );
+    }
+    if (
+      options.httpMetadata !== undefined &&
+      typeof options.httpMetadata !== "object"
+    ) {
+      throw new TypeError(
+        "Incorrect type for the 'httpMetadata' field on 'MultipartOptions': the provided value is not of type 'HttpMetadata or Headers'."
+      );
+    }
+    const customMetadata = options.customMetadata ?? {};
+    const httpMetadata = parseHttpMetadata(options.httpMetadata);
+
+    // Creating a multipart upload isn't observable so no need to wait on
+    // output gate to open
+    const upload = await createMultipartUpload(
+      key,
+      { customMetadata, httpMetadata },
+      this.#multipartOpts
+    );
+    await waitForOpenInputGate();
+    ctx?.advanceCurrentTime();
+
+    return upload;
+  }
+
+  resumeMultipartUpload(key: string, uploadId: string): R2MultipartUpload {
+    // The Workers runtime doesn't make a subrequest here, so no need to call
+    // `prepareCtx()`
+
+    // The Workers runtime will coerce key and uploadId parameters to a string
+    if (arguments.length === 0) {
+      throw new TypeError(buildKeyTypeError("resumeMultipartUpload"));
+    }
+    if (arguments.length === 1) {
+      throw new TypeError(
+        "Failed to execute 'resumeMultipartUpload' on 'R2Bucket': parameter 2 is not of type 'string'."
+      );
+    }
+    key = String(key);
+    uploadId = String(uploadId);
+
+    return new R2MultipartUpload(key, uploadId, this.#multipartOpts);
   }
 }

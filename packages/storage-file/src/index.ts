@@ -1,12 +1,14 @@
-import { existsSync } from "fs";
+import fs, { existsSync } from "fs";
 import path from "path";
 import {
   MiniflareError,
   Range,
   RangeStoredValueMeta,
+  SqliteDB,
   StoredKeyMeta,
   StoredMeta,
   StoredValueMeta,
+  createSQLiteDB,
   defaultClock,
   sanitisePath,
   viewToArray,
@@ -34,6 +36,7 @@ export interface FileMeta<Meta = unknown> extends StoredMeta<Meta> {
 
 export class FileStorage extends LocalStorage {
   protected readonly root: string;
+  private sqliteDB?: SqliteDB;
 
   constructor(
     root: string,
@@ -102,6 +105,14 @@ export class FileStorage extends LocalStorage {
       if (e.code === "ENOTDIR") return;
       throw e;
     }
+  }
+
+  async getSqliteDatabase(): Promise<SqliteDB> {
+    if (this.sqliteDB) return this.sqliteDB;
+
+    fs.mkdirSync(path.dirname(this.root), { recursive: true });
+    this.sqliteDB = await createSQLiteDB(this.root + ".sqlite3");
+    return this.sqliteDB;
   }
 
   async getRangeMaybeExpired<Meta = unknown>(
@@ -203,7 +214,11 @@ export class FileStorage extends LocalStorage {
       // Try to get file meta
       const meta = await this.meta<Meta>(filePath);
       // Get the real unsanitised key if it exists
-      const realName = meta?.key ?? name;
+      const realName =
+        meta?.key ??
+        // If this is unsanitised storage (e.g. Workers Sites), make sure we
+        // return POSIX paths
+        (this.sanitise ? name : name.split(path.sep).join(path.posix.sep));
 
       keys.push({
         name: realName,

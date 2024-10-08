@@ -3,17 +3,20 @@ import fs from "fs/promises";
 import path from "path";
 import { promisify } from "util";
 import { BindingsPlugin, BuildError, BuildPlugin } from "@miniflare/core";
+import { QueueBroker } from "@miniflare/queues";
 import {
   Compatibility,
   LogLevel,
   NoOpLog,
   PluginContext,
+  QueueEventDispatcher,
 } from "@miniflare/shared";
 import {
   TestLog,
   logPluginOptions,
   parsePluginArgv,
   parsePluginWranglerConfig,
+  unusable,
   useMiniflare,
   useTmp,
 } from "@miniflare/shared-test";
@@ -24,7 +27,16 @@ import which from "which";
 const log = new NoOpLog();
 const compat = new Compatibility();
 const rootPath = process.cwd();
-const ctx: PluginContext = { log, compat, rootPath };
+const queueBroker = new QueueBroker();
+const queueEventDispatcher: QueueEventDispatcher = async (_batch) => {};
+const ctx: PluginContext = {
+  log,
+  compat,
+  rootPath,
+  queueBroker,
+  queueEventDispatcher,
+  sharedCache: unusable(),
+};
 
 const rimrafPromise = promisify(rimraf);
 
@@ -86,6 +98,18 @@ test("BuildPlugin: parses options from wrangler config", (t) => {
     buildBasePath: undefined,
     buildWatchPaths: undefined,
   });
+  // build.watch_dir should accept an array of strings
+  options = parsePluginWranglerConfig(BuildPlugin, {
+    build: {
+      watch_dir: ["source", "source1"],
+    },
+    miniflare: {
+      build_watch_dirs: ["source2", "source3"],
+    },
+  });
+  t.like(options, {
+    buildWatchPaths: ["source2", "source3", "source", "source1"],
+  });
 });
 test("BuildPlugin: logs options", (t) => {
   const logs = logPluginOptions(BuildPlugin, {
@@ -108,7 +132,7 @@ test("BuildPlugin: beforeSetup: runs build successfully", async (t) => {
   const tmp = await useTmp(t);
   const log = new TestLog();
   const plugin = new BuildPlugin(
-    { log, compat, rootPath },
+    { ...ctx, log },
     {
       buildCommand: "echo test > test.txt",
       buildBasePath: tmp,
@@ -127,7 +151,7 @@ test("BuildPlugin: beforeSetup: builds in plugin context's rootPath", async (t) 
   const tmp = await useTmp(t);
   let plugin = new BuildPlugin(
     // This will be set to the mounted directory when mounting workers
-    { log, compat, rootPath: tmp },
+    { ...ctx, rootPath: tmp },
     { buildCommand: "echo test > test.txt" }
   );
   await plugin.beforeSetup();
@@ -138,7 +162,7 @@ test("BuildPlugin: beforeSetup: builds in plugin context's rootPath", async (t) 
   const dir = path.join(tmp, "dir");
   await fs.mkdir(dir);
   plugin = new BuildPlugin(
-    { log, compat, rootPath: tmp },
+    { ...ctx, rootPath: tmp },
     { buildCommand: "echo test > test.txt", buildBasePath: "dir" }
   );
   await plugin.beforeSetup();

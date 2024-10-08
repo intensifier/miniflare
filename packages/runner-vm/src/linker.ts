@@ -1,10 +1,10 @@
 import { readFileSync } from "fs";
-import fs from "fs/promises";
 import { builtinModules } from "module";
 import path from "path";
-import vm from "vm";
+import vm, { SourceTextModuleImportModuleDynamically } from "vm";
 import {
   AdditionalModules,
+  Compatibility,
   Context,
   ProcessedModuleRule,
   STRING_SCRIPT_PATH,
@@ -26,17 +26,22 @@ interface CommonJSModule {
   exports: any;
 }
 
+const linkingPromises = new WeakMap<vm.Module, Promise<vm.Module>>();
+const evaluatingPromises = new WeakMap<vm.Module, Promise<void>>();
+
 export class ModuleLinker {
   readonly #referencedPathSizes = new Map<string, number>();
   readonly #moduleCache = new Map<string, vm.Module>();
   readonly #cjsModuleCache = new Map<string, CommonJSModule>();
+  // Make sure we always return the same objects from `require()` when the
+  // `export_commonjs_default` compatibility flag is disabled
+  readonly #namespaceCache = new WeakMap<any, any>();
 
   constructor(
-    private moduleRules: ProcessedModuleRule[],
-    private additionalModules: AdditionalModules
-  ) {
-    this.linker = this.linker.bind(this);
-  }
+    private readonly moduleRules: ProcessedModuleRule[],
+    private readonly additionalModules: AdditionalModules,
+    private readonly compat?: Compatibility
+  ) {}
 
   get referencedPaths(): IterableIterator<string> {
     return this.#referencedPathSizes.keys();
@@ -49,7 +54,7 @@ export class ModuleLinker {
     return sizes.reduce((total, size) => total + size, 0);
   }
 
-  async linker(spec: string, referencing: vm.Module): Promise<vm.Module> {
+  linker = (spec: string, referencing: vm.Module): vm.Module => {
     const relative = path.relative("", referencing.identifier);
     const errorBase = `Unable to resolve "${relative}" dependency "${spec}"`;
 
@@ -89,11 +94,7 @@ export class ModuleLinker {
       return module;
     }
 
-    // Find first matching module rule ("ignore" requires relative paths)
-    const relativeIdentifier = path.relative("", identifier);
-    const rule = this.moduleRules.find((rule) =>
-      rule.include.test(relativeIdentifier)
-    );
+    const rule = this.moduleRules.find((rule) => rule.include.test(identifier));
     if (rule === undefined) {
       const isBuiltin = builtinModules.includes(spec);
       const suggestion = isBuiltin ? SUGGEST_NODE : SUGGEST_BUNDLE;
@@ -104,14 +105,17 @@ export class ModuleLinker {
     }
 
     // Load module based on rule type
-    const data = await fs.readFile(identifier);
+    const data = readFileSync(identifier);
     this.#referencedPathSizes.set(identifier, data.byteLength);
     switch (rule.type) {
       case "ESModule":
-        module = new vm.SourceTextModule(data.toString("utf8"), moduleOptions);
+        module = new vm.SourceTextModule(data.toString("utf8"), {
+          ...moduleOptions,
+          importModuleDynamically: this.importModuleDynamically,
+        });
         break;
       case "CommonJS":
-        const exports = this.loadCommonJSModule(
+        const mod = this.loadCommonJSModule(
           errorBase,
           identifier,
           spec,
@@ -120,7 +124,7 @@ export class ModuleLinker {
         module = new vm.SyntheticModule<{ default: Context }>(
           ["default"],
           function () {
-            this.setExport("default", exports);
+            this.setExport("default", mod.exports);
           },
           moduleOptions
         );
@@ -160,34 +164,54 @@ export class ModuleLinker {
     }
     this.#moduleCache.set(identifier, module);
     return module;
-  }
+  };
+
+  importModuleDynamically: SourceTextModuleImportModuleDynamically = async (
+    spec,
+    referencing
+  ) => {
+    const module = this.linker(spec, referencing);
+
+    // Defend against concurrent execution by only calling `link()` and
+    // `evaluate()` once, then storing the resulting `Promise` so future
+    // executions can await it. Note, the `get()` calls below may return
+    // `undefined` if `module` was already loaded statically.
+
+    if (module.status === "unlinked") {
+      linkingPromises.set(module, module.link(this.linker));
+    }
+    await linkingPromises.get(module);
+
+    if (module.status === "linked") {
+      evaluatingPromises.set(module, module.evaluate());
+    }
+    await evaluatingPromises.get(module);
+
+    return module;
+  };
 
   private loadCommonJSModule(
     errorBase: string,
     identifier: string,
     spec: string,
     context: vm.Context
-  ): any {
+  ): CommonJSModule {
     // If we've already seen a module with the same identifier, return it, to
     // handle import cycles
     const cached = this.#cjsModuleCache.get(identifier);
-    if (cached) return cached.exports;
+    if (cached) return cached;
 
     const additionalModule = this.additionalModules[spec];
     const module: CommonJSModule = { exports: {} };
 
     // If this is an additional module, return it immediately
     if (additionalModule) {
-      module.exports.default = additionalModule.default;
+      module.exports = additionalModule.default;
       this.#cjsModuleCache.set(identifier, module);
-      return module.exports;
+      return module;
     }
 
-    // Find first matching module rule ("ignore" requires relative paths)
-    const relativeIdentifier = path.relative("", identifier);
-    const rule = this.moduleRules.find((rule) =>
-      rule.include.test(relativeIdentifier)
-    );
+    const rule = this.moduleRules.find((rule) => rule.include.test(identifier));
     if (rule === undefined) {
       const isBuiltin = builtinModules.includes(spec);
       const suggestion = isBuiltin ? SUGGEST_NODE : SUGGEST_BUNDLE;
@@ -223,13 +247,13 @@ export class ModuleLinker {
         moduleWrapper(module.exports, require, module);
         break;
       case "Text":
-        module.exports.default = data.toString("utf8");
+        module.exports = data.toString("utf8");
         break;
       case "Data":
-        module.exports.default = viewToBuffer(data);
+        module.exports = viewToBuffer(data);
         break;
       case "CompiledWasm":
-        module.exports.default = new WebAssembly.Module(data);
+        module.exports = new WebAssembly.Module(data);
         break;
       default:
         throw new VMScriptRunnerError(
@@ -237,7 +261,7 @@ export class ModuleLinker {
           `${errorBase}: ${rule.type} modules are unsupported`
         );
     }
-    return module.exports;
+    return module;
   }
 
   private createRequire(referencingIdentifier: string, context: vm.Context) {
@@ -247,7 +271,24 @@ export class ModuleLinker {
       const errorBase = `Unable to resolve "${relative}" dependency "${spec}"`;
       // Get path to specified module relative to referencing module
       const identifier = path.resolve(referencingDirname, spec);
-      return this.loadCommonJSModule(errorBase, identifier, spec, context);
+      const mod = this.loadCommonJSModule(errorBase, identifier, spec, context);
+      // https://developers.cloudflare.com/workers/platform/compatibility-dates/#commonjs-modules-do-not-export-a-module-namespace
+      if (
+        this.compat === undefined ||
+        this.compat.isEnabled("export_commonjs_default")
+      ) {
+        return mod.exports;
+      } else {
+        // Make sure we always return the same object for an identifier
+        let ns = this.#namespaceCache.get(mod);
+        if (ns !== undefined) return ns;
+        ns = Object.defineProperty({}, "default", {
+          get: () => mod.exports,
+          enumerable: true,
+        });
+        this.#namespaceCache.set(mod, ns);
+        return ns;
+      }
     };
   }
 }

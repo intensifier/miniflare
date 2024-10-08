@@ -5,7 +5,6 @@ import { Blob } from "buffer";
 import type EventEmitter from "events";
 import http from "http";
 import {
-  ReadableByteStreamController,
   ReadableStream,
   ReadableStreamDefaultReader,
   UnderlyingByteSource,
@@ -21,7 +20,16 @@ import {
   waitForOpenOutputGate,
 } from "@miniflare/shared";
 import type { WebSocket } from "@miniflare/web-sockets";
-import { Colorize, blue, bold, green, grey, red, yellow } from "kleur/colors";
+import {
+  Colorize,
+  blue,
+  bold,
+  dim,
+  green,
+  grey,
+  red,
+  yellow,
+} from "kleur/colors";
 import { splitCookiesString } from "set-cookie-parser";
 import {
   Request as BaseRequest,
@@ -34,14 +42,9 @@ import {
   File,
   FormData,
   Headers,
-  ReferrerPolicy,
-  RequestCache,
-  RequestCredentials,
-  RequestDestination,
-  RequestMode,
+  MockAgent,
   RequestRedirect,
   ResponseRedirectStatus,
-  ResponseType,
   fetch as baseFetch,
   getGlobalDispatcher,
 } from "undici";
@@ -51,7 +54,12 @@ import {
   buildNotBufferSourceError,
   isBufferSource,
 } from "./helpers";
-import { kContentLength } from "./streams";
+import {
+  _isByteStream,
+  convertToRegularStream,
+  kBodyStreamBrand,
+  kContentLength,
+} from "./streams";
 
 // We need these for making Request's Headers immutable
 const fetchSymbols: {
@@ -82,6 +90,12 @@ function makeEnumerable<T>(prototype: any, instance: T, keys: (keyof T)[]) {
     descriptor.enumerable = true;
     Object.defineProperty(instance, key, descriptor);
   }
+}
+
+function unimplemented(klass: string, property: string): never {
+  throw new Error(
+    `Failed to get the '${property}' property on '${klass}': the property is not implemented.`
+  );
 }
 
 // Manipulating the prototype like this isn't very nice. However, this is a
@@ -148,27 +162,10 @@ export function _headersFromIncomingRequest(
 /** @internal */
 export const _kInner = Symbol("kInner");
 
+const kBodyStream = Symbol("kBodyStream");
 const kInputGated = Symbol("kInputGated");
 const kFormDataFiles = Symbol("kFormDataFiles");
 const kCloned = Symbol("kCloned");
-
-/** @internal */
-export function _isByteStream(
-  stream: ReadableStream
-): stream is ReadableStream<Uint8Array> {
-  // Try to determine if stream is a byte stream by inspecting its state.
-  // It doesn't matter too much if the internal representation changes in the
-  // future: this code shouldn't throw. Currently we only use this as an
-  // optimisation to avoid creating a byte stream if it's already one.
-  for (const symbol of Object.getOwnPropertySymbols(stream)) {
-    if (symbol.description === "kState") {
-      // @ts-expect-error symbol properties are not included in type definitions
-      const controller = stream[symbol].controller;
-      return controller instanceof ReadableByteStreamController;
-    }
-  }
-  return false;
-}
 
 const enumerableBodyKeys: (keyof Body<any>)[] = ["body", "bodyUsed", "headers"];
 export class Body<Inner extends BaseRequest | BaseResponse> {
@@ -177,7 +174,7 @@ export class Body<Inner extends BaseRequest | BaseResponse> {
   [kInputGated] = false;
   [kFormDataFiles] = true; // Default to enabling form-data File parsing
   [kCloned] = false;
-  #bodyStream?: ReadableStream<Uint8Array>;
+  [kBodyStream]?: ReadableStream<Uint8Array>;
 
   constructor(inner: Inner) {
     // Allow forbidden header mutation after construction
@@ -205,7 +202,8 @@ export class Body<Inner extends BaseRequest | BaseResponse> {
 
     if (body === null) return body;
     // Only transform body stream once
-    if (this.#bodyStream) return this.#bodyStream;
+    let bodyStream = this[kBodyStream];
+    if (bodyStream) return bodyStream;
     assert(body instanceof ReadableStream);
 
     // Cloudflare Workers allows you to byob-read all Request/Response bodies,
@@ -218,7 +216,7 @@ export class Body<Inner extends BaseRequest | BaseResponse> {
     // If we're not input gating, and body is already a byte stream, we're set,
     // just return it as is (this will be the case for incoming http requests)
     if (!this[kInputGated] && _isByteStream(body)) {
-      return (this.#bodyStream = body);
+      return (this[kBodyStream] = body);
     }
 
     // Otherwise, we need to create a "byte-TransformStream" that makes sure
@@ -267,10 +265,26 @@ export class Body<Inner extends BaseRequest | BaseResponse> {
           controller.byobRequest?.respond(0);
         }
       },
-      cancel: (reason) => reader.cancel(reason),
+      cancel: (reason) => {
+        if (reader === undefined) reader = body.getReader();
+        return reader.cancel(reason);
+      },
     };
     // TODO: maybe set { highWaterMark: 0 } as a strategy here?
-    return (this.#bodyStream = new ReadableStream(source));
+    bodyStream = new ReadableStream(source);
+    Object.defineProperty(bodyStream, kBodyStreamBrand, { value: true });
+
+    // If this body has a known content length, attach it to the body
+    // https://github.com/cloudflare/miniflare/issues/522
+    // (note `parseInt(null)` is `NaN`)
+    const maybeContentLength = parseInt(this.headers.get("Content-Length")!);
+    if (!isNaN(maybeContentLength)) {
+      Object.defineProperty(bodyStream, kContentLength, {
+        value: maybeContentLength,
+      });
+    }
+
+    return (this[kBodyStream] = bodyStream);
   }
   get bodyUsed(): boolean {
     return this[_kInner].bodyUsed;
@@ -300,37 +314,44 @@ export class Body<Inner extends BaseRequest | BaseResponse> {
       );
     }
     const formData = new FormData();
-    await new Promise<void>(async (resolve) => {
-      const Busboy: typeof import("busboy") = require("busboy");
-      const busboy = Busboy({ headers: headers as http.IncomingHttpHeaders });
-      busboy.on("field", (name, value) => {
-        formData.append(name, value);
-      });
-      busboy.on("file", (name, value, info) => {
-        const { filename, encoding, mimeType } = info;
-        const base64 = encoding.toLowerCase() === "base64";
-        const chunks: Buffer[] = [];
-        let totalLength = 0;
-        value.on("data", (chunk: Buffer) => {
-          if (base64) chunk = Buffer.from(chunk.toString(), "base64");
-          chunks.push(chunk);
-          totalLength += chunk.byteLength;
+    await new Promise<void>(async (resolve, reject) => {
+      try {
+        const Busboy: typeof import("busboy") = require("busboy");
+        const busboy = Busboy({
+          headers: headers as http.IncomingHttpHeaders,
+          preservePath: true,
         });
-        value.on("end", () => {
-          if (this[kFormDataFiles]) {
-            const file = new File(chunks, filename, { type: mimeType });
-            formData.append(name, file);
-          } else {
-            const text = Buffer.concat(chunks, totalLength).toString();
-            formData.append(name, text);
-          }
+        busboy.on("field", (name, value) => {
+          formData.append(name, value);
         });
-      });
-      busboy.on("finish", resolve);
+        busboy.on("file", (name, value, info) => {
+          const { filename, encoding, mimeType } = info;
+          const base64 = encoding.toLowerCase() === "base64";
+          const chunks: Buffer[] = [];
+          let totalLength = 0;
+          value.on("data", (chunk: Buffer) => {
+            if (base64) chunk = Buffer.from(chunk.toString(), "base64");
+            chunks.push(chunk);
+            totalLength += chunk.byteLength;
+          });
+          value.on("end", () => {
+            if (this[kFormDataFiles]) {
+              const file = new File(chunks, filename, { type: mimeType });
+              formData.append(name, file);
+            } else {
+              const text = Buffer.concat(chunks, totalLength).toString();
+              formData.append(name, text);
+            }
+          });
+        });
+        busboy.on("finish", resolve);
 
-      const body = this[_kInner].body;
-      if (body !== null) for await (const chunk of body) busboy.write(chunk);
-      busboy.end();
+        const body = this[_kInner].body;
+        if (body !== null) for await (const chunk of body) busboy.write(chunk);
+        busboy.end();
+      } catch (e) {
+        reject(new TypeError(e instanceof Error ? e.message : String(e)));
+      }
     });
     if (this[kInputGated]) await waitForOpenInputGate();
     return formData;
@@ -361,15 +382,18 @@ export function withStringFormDataFiles<
   return body;
 }
 
+/** @internal */
+export function _isBodyStream(stream: ReadableStream): boolean {
+  return (
+    (stream as { [kBodyStreamBrand]?: unknown })[kBodyStreamBrand] === true
+  );
+}
+
 export type RequestInfo = BaseRequestInfo | Request;
 
 export interface RequestInit extends BaseRequestInit {
-  readonly cf?: IncomingRequestCfProperties | RequestInitCfProperties;
+  cf?: IncomingRequestCfProperties | RequestInitCfProperties;
 }
-
-type Mutable<T> = {
-  -readonly [P in keyof T]: T[P];
-};
 
 const enumerableRequestKeys: (keyof Request)[] = [
   "cf",
@@ -378,31 +402,78 @@ const enumerableRequestKeys: (keyof Request)[] = [
   "url",
   "method",
 ];
+
+// These keys aren't marked enumerable on `BaseRequest`, so we can't use
+// `{...req}` to clone the init object. Instead, we use `in` checks and copy
+// them over if present.
+const requestInitKeys: (keyof RequestInit)[] = [
+  "method",
+  "keepalive",
+  "headers",
+  "body",
+  "redirect",
+  "integrity",
+  "signal",
+  "credentials",
+  "mode",
+  "referrer",
+  "referrerPolicy",
+  "window",
+  "dispatcher",
+  "duplex",
+];
+function cloneRequestInit(init: RequestInit): RequestInit {
+  const result: RequestInit = {};
+  for (const key of requestInitKeys) {
+    if (key in init) (result as Record<string, unknown>)[key] = init[key];
+  }
+  return result;
+}
+
 export class Request extends Body<BaseRequest> {
   // noinspection TypeScriptFieldCanBeMadeReadonly
   #cf?: IncomingRequestCfProperties | RequestInitCfProperties;
 
   constructor(input: RequestInfo, init?: RequestInit) {
-    const cf = input instanceof Request ? input.#cf : init?.cf;
+    // If body is a FixedLengthStream, set Content-Length to its expected
+    // length. We may replace `init.body` later on with a different stream, so
+    // extract `contentLength` now.
+    const contentLength: number | undefined = (
+      init?.body as { [kContentLength]?: number }
+    )?.[kContentLength];
+
+    const cf = input instanceof Request ? init?.cf ?? input.#cf : init?.cf;
     if (input instanceof BaseRequest && !init) {
       // For cloning
       super(input);
     } else {
       // Don't pass our strange hybrid Request to undici
       if (input instanceof Request) input = input[_kInner];
+      if (init instanceof Request) init = init[_kInner] as RequestInit;
+      // We may mutate some `init` properties below, make sure these aren't
+      // visible to the caller
+      init = init ? cloneRequestInit(init) : undefined;
       // If body is an ArrayBuffer, clone it, so it doesn't get detached when
       // enqueuing the chunk to the body stream
       if (init?.body instanceof ArrayBuffer) {
-        (init as Mutable<RequestInit>).body = init.body.slice(0);
+        init.body = init.body.slice(0);
+      }
+      if (init?.body instanceof ReadableStream) {
+        init.duplex = "half";
+        if (_isByteStream(init.body)) {
+          // Since `undici@5.12.0`, cloning a body now invokes `structuredClone`
+          // on the underlying stream (https://github.com/nodejs/undici/pull/1697).
+          // Unfortunately, due to a bug in Node, byte streams cannot be
+          // `structuredClone`d (https://github.com/nodejs/undici/issues/1873,
+          // https://github.com/nodejs/node/pull/45955), leading to issues when
+          // attempting to clone incoming requests.
+          init.body = convertToRegularStream(init.body);
+        }
       }
       super(new BaseRequest(input, init));
     }
     this.#cf = cf ? nonCircularClone(cf) : undefined;
 
-    // If body is a FixedLengthStream, set Content-Length to its expected length
-    const contentLength: number | undefined = (init?.body as any)?.[
-      kContentLength
-    ];
     if (contentLength !== undefined) {
       this.headers.set("content-length", contentLength.toString());
     }
@@ -412,6 +483,7 @@ export class Request extends Body<BaseRequest> {
 
   clone(): Request {
     const innerClone = this[_kInner].clone();
+    this[kBodyStream] = undefined;
     const clone = new Request(innerClone);
     clone[kInputGated] = this[kInputGated];
     clone[kFormDataFiles] = this[kFormDataFiles];
@@ -427,54 +499,51 @@ export class Request extends Body<BaseRequest> {
     return clone;
   }
 
-  get cf(): IncomingRequestCfProperties | RequestInitCfProperties | undefined {
-    return this.#cf;
-  }
-
   // Pass-through standard properties
-  get cache(): RequestCache {
-    return this[_kInner].cache;
-  }
-  get credentials(): RequestCredentials {
-    return this[_kInner].credentials;
-  }
-  get destination(): RequestDestination {
-    return this[_kInner].destination;
-  }
-  get integrity(): string {
-    return this[_kInner].integrity;
-  }
   get method(): string {
     return this[_kInner].method;
-  }
-  get mode(): RequestMode {
-    return this[_kInner].mode;
-  }
-  get redirect(): RequestRedirect {
-    return this[_kInner].redirect;
-  }
-  get referrerPolicy(): ReferrerPolicy {
-    return this[_kInner].referrerPolicy as ReferrerPolicy;
   }
   get url(): string {
     return this[_kInner].url;
   }
-  get keepalive(): boolean {
-    return this[_kInner].keepalive;
+  get redirect(): RequestRedirect {
+    return this[_kInner].redirect;
   }
   get signal(): AbortSignal {
     return this[_kInner].signal;
   }
+  get cf(): IncomingRequestCfProperties | RequestInitCfProperties | undefined {
+    return this.#cf;
+  }
+
+  // Unimplemented properties
+  get context(): never {
+    return unimplemented("Request", "context");
+  }
+  get mode(): never {
+    return unimplemented("Request", "mode");
+  }
+  get credentials(): never {
+    return unimplemented("Request", "credentials");
+  }
+  get integrity(): never {
+    return unimplemented("Request", "integrity");
+  }
+  get cache(): never {
+    return unimplemented("Request", "cache");
+  }
 }
 
-export function withImmutableHeaders(req: Request): Request {
+export function withImmutableHeaders<Body extends Request | Response>(
+  body: Body
+): Body {
   // @ts-expect-error internal kGuard isn't included in type definitions
-  req.headers[fetchSymbols.kGuard] = "immutable";
-  return req;
+  body.headers[fetchSymbols.kGuard] = "immutable";
+  return body;
 }
 
 export interface ResponseInit extends BaseResponseInit {
-  readonly encodeBody?: "auto" | "manual";
+  readonly encodeBody?: "automatic" | "manual";
   readonly webSocket?: WebSocket;
 }
 
@@ -485,7 +554,6 @@ const kWaitUntil = Symbol("kWaitUntil");
 const nullBodyStatus: (number | undefined)[] = [101, 204, 205, 304];
 
 const enumerableResponseKeys: (keyof Response)[] = [
-  "encodeBody",
   "webSocket",
   "url",
   "redirected",
@@ -513,13 +581,20 @@ export class Response<
 
   // https://developers.cloudflare.com/workers/runtime-apis/response#properties
   // noinspection TypeScriptFieldCanBeMadeReadonly
-  #encodeBody: "auto" | "manual";
+  #encodeBody: "automatic" | "manual";
   // noinspection TypeScriptFieldCanBeMadeReadonly
   #status?: number;
   readonly #webSocket?: WebSocket;
   [kWaitUntil]?: Promise<WaitUntil>;
 
   constructor(body?: BodyInit, init?: ResponseInit | Response | BaseResponse) {
+    // If body is a FixedLengthStream, set Content-Length to its expected
+    // length. We may replace `body` later on with a different stream, so
+    // extract `contentLength` now.
+    const contentLength: number | undefined = (
+      body as { [kContentLength]?: number }
+    )?.[kContentLength];
+
     let encodeBody: string | undefined;
     let status: number | undefined;
     let webSocket: WebSocket | undefined;
@@ -531,6 +606,15 @@ export class Response<
       // enqueuing the chunk to the body stream
       if (body instanceof ArrayBuffer) {
         body = body.slice(0);
+      }
+      if (body instanceof ReadableStream && _isByteStream(body)) {
+        // Since `undici@5.12.0`, cloning a body now invokes `structuredClone`
+        // on the underlying stream (https://github.com/nodejs/undici/pull/1697).
+        // Unfortunately, due to a bug in Node, byte streams cannot be
+        // `structuredClone`d (https://github.com/nodejs/undici/issues/1873,
+        // https://github.com/nodejs/node/pull/45955), leading to issues when
+        // constructing bodies with byte streams.
+        body = convertToRegularStream(body);
       }
 
       if (init instanceof Response) {
@@ -569,8 +653,8 @@ export class Response<
       super(new BaseResponse(body, init));
     }
 
-    encodeBody ??= "auto";
-    if (encodeBody !== "auto" && encodeBody !== "manual") {
+    encodeBody ??= "automatic";
+    if (encodeBody !== "automatic" && encodeBody !== "manual") {
       throw new TypeError(`encodeBody: unexpected value: ${encodeBody}`);
     }
     this.#encodeBody = encodeBody;
@@ -578,8 +662,6 @@ export class Response<
     this.#status = status;
     this.#webSocket = webSocket;
 
-    // If body is a FixedLengthStream, set Content-Length to its expected length
-    const contentLength: number | undefined = (body as any)?.[kContentLength];
     if (contentLength !== undefined) {
       this.headers.set("content-length", contentLength.toString());
     }
@@ -593,6 +675,7 @@ export class Response<
       throw new TypeError("Cannot clone a response to a WebSocket handshake.");
     }
     const innerClone = this[_kInner].clone();
+    this[kBodyStream] = undefined;
     const clone = new Response(innerClone.body, innerClone);
     clone[kInputGated] = this[kInputGated];
     clone[kFormDataFiles] = this[kFormDataFiles];
@@ -610,10 +693,9 @@ export class Response<
     return clone;
   }
 
-  get encodeBody(): "auto" | "manual" {
+  get encodeBody(): "automatic" | "manual" {
     return this.#encodeBody;
   }
-
   get webSocket(): WebSocket | undefined {
     return this.#webSocket;
   }
@@ -622,27 +704,29 @@ export class Response<
     return this[kWaitUntil] ?? Promise.resolve([] as unknown as WaitUntil);
   }
 
+  // Pass-through standard properties
   get status(): number {
     return this.#status ?? this[_kInner].status;
-  }
-
-  // Pass-through standard properties
-  get ok(): boolean {
-    return this[_kInner].ok;
   }
   get statusText(): string {
     return this[_kInner].statusText;
   }
-  get type(): ResponseType {
-    throw new Error(
-      "Failed to get the 'type' property on 'Response': the property is not implemented."
-    );
+  get ok(): boolean {
+    return this[_kInner].ok;
+  }
+  get redirected(): boolean {
+    return this[_kInner].redirected;
   }
   get url(): string {
     return this[_kInner].url;
   }
-  get redirected(): boolean {
-    return this[_kInner].redirected;
+
+  // Unimplemented properties
+  get type(): never {
+    return unimplemented("Response", "type");
+  }
+  get useFinalUrl(): never {
+    return unimplemented("Response", "useFinalUrl");
   }
 }
 
@@ -715,14 +799,10 @@ class MiniflareDispatcher extends Dispatcher {
     options: Dispatcher.DispatchOptions,
     handler: Dispatcher.DispatchHandlers
   ): boolean {
+    // Remove any default fetch headers that the user didn't explicitly set,
+    // `headers` has the form `["key1", "value1", "key2", "value2", ...]`
     const headers = options.headers;
-    if (headers) {
-      // Note: I'm fully expecting this to break in future undici versions
-      // and need to be updated, but that's why we pin our undici version and
-      // have tests
-      assert(Array.isArray(headers));
-      // Remove any default fetch headers that the user didn't explicitly set,
-      // `headers` has the form `["key1", "value1", "key2", "value2", ...]`
+    if (Array.isArray(headers)) {
       let i = 0;
       while (i < headers.length) {
         if (this.removeHeaders.includes(headers[i].toLowerCase())) {
@@ -730,6 +810,10 @@ class MiniflareDispatcher extends Dispatcher {
         } else {
           i += 2;
         }
+      }
+    } else if (headers != null) {
+      for (const key in headers) {
+        if (this.removeHeaders.includes(key.toLowerCase())) delete headers[key];
       }
     }
     return this.inner.dispatch(options, handler);
@@ -744,9 +828,19 @@ class MiniflareDispatcher extends Dispatcher {
     // @ts-expect-error just want to pass through to global dispatcher here
     return this.inner.destroy(...args);
   }
+
+  /**
+   * Required for some testing utilities.
+   * For context see: https://github.com/nodejs/undici/issues/1756#issuecomment-1304711596
+   */
+  get isMockActive(): boolean {
+    // @ts-expect-error Missing type on MockAgent, but exists at runtime
+    return this.inner.isMockActive ?? false;
+  }
 }
 
 export async function fetch(
+  this: Dispatcher | unknown,
   input: RequestInfo,
   init?: RequestInit
 ): Promise<Response> {
@@ -759,11 +853,8 @@ export async function fetch(
 
   await waitForOpenOutputGate();
 
-  // Don't pass our strange hybrid Request to undici
-  if (input instanceof Request) input = input[_kInner];
-
   // Set the headers guard to "none" so we can delete the "Host" header
-  const req = new BaseRequest(input, init);
+  const req = new Request(input, init);
   // @ts-expect-error internal kGuard isn't included in type definitions
   req.headers[fetchSymbols.kGuard] = "none";
   // Delete the "Host" header, the correct value will be added by undici
@@ -776,7 +867,6 @@ export async function fetch(
   // Delete "content-length: 0" from bodyless requests. Some proxies add this,
   // but undici considers it an error.
   // See https://github.com/cloudflare/miniflare/issues/193
-
   if (
     !methodsExpectingPayload.includes(req.method) &&
     req.headers.get("content-length") === "0"
@@ -793,10 +883,11 @@ export async function fetch(
   // TODO: instead of using getGlobalDispatcher() here, we could allow a custom
   //  one to be passed for easy mocking
   const dispatcher = new MiniflareDispatcher(
-    getGlobalDispatcher(),
+    this instanceof Dispatcher ? this : getGlobalDispatcher(),
     removeHeaders
   );
-  const baseRes = await baseFetch(req, { dispatcher });
+  // Don't pass our strange hybrid Request to undici
+  const baseRes = await baseFetch(req[_kInner], { dispatcher });
 
   // Increment the subrequest count by the number of redirects
   // TODO (someday): technically we should check the subrequest count before
@@ -820,6 +911,10 @@ export async function fetch(
   await waitForOpenInputGate();
   ctx?.advanceCurrentTime();
   return withInputGating(res);
+}
+
+export function createFetchMock() {
+  return new MockAgent();
 }
 
 /** @internal */
@@ -902,6 +997,10 @@ function millisFromHRTime([seconds, nanoseconds]: HRTime): string {
   return `${((seconds * 1e9 + nanoseconds) / 1e6).toFixed(2)}ms`;
 }
 
+function millisFromCPUTime(microseconds: number): string {
+  return `${(microseconds / 1e3).toFixed(2)}ms`;
+}
+
 function colourFromHTTPStatus(status: number): Colorize {
   if (200 <= status && status < 300) return green;
   if (400 <= status && status < 500) return yellow;
@@ -913,19 +1012,27 @@ export async function logResponse(
   log: Log,
   {
     start,
+    startCpu,
     method,
     url,
     status,
     waitUntil,
   }: {
     start: HRTime;
+    startCpu?: NodeJS.CpuUsage;
     method: string;
     url: string;
     status?: number;
     waitUntil?: Promise<any[]>;
   }
 ): Promise<void> {
+  const cpuParts: string[] = [];
+
   const responseTime = millisFromHRTime(process.hrtime(start));
+  if (startCpu !== undefined) {
+    const responseTimeCpu = millisFromCPUTime(process.cpuUsage(startCpu).user);
+    cpuParts.push(dim(grey(` (CPU: ~${responseTimeCpu}`)));
+  }
 
   // Wait for all waitUntil promises to resolve
   let waitUntilResponse: any[] | undefined;
@@ -937,6 +1044,15 @@ export async function logResponse(
     log.error(e);
   }
   const waitUntilTime = millisFromHRTime(process.hrtime(start));
+  if (startCpu !== undefined) {
+    if (waitUntilResponse?.length) {
+      const waitUntilTimeCpu = millisFromCPUTime(
+        process.cpuUsage(startCpu).user
+      );
+      cpuParts.push(dim(grey(`, waitUntil: ~${waitUntilTimeCpu}`)));
+    }
+    cpuParts.push(dim(grey(")")));
+  }
 
   log.log(
     [
@@ -950,6 +1066,7 @@ export async function logResponse(
       // Only include waitUntilTime if there were waitUntil promises
       waitUntilResponse?.length ? grey(`, waitUntil: ${waitUntilTime}`) : "",
       grey(")"),
+      ...cpuParts,
     ].join("")
   );
 }

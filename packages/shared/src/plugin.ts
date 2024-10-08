@@ -1,6 +1,8 @@
+import { MockAgent } from "undici";
 import { Compatibility } from "./compat";
 import { titleCase } from "./data";
 import { Log } from "./log";
+import { QueueBroker, QueueEventDispatcher } from "./queues";
 import { ScriptBlueprint } from "./runner";
 import { StorageFactory } from "./storage";
 import { Awaitable } from "./sync";
@@ -55,7 +57,7 @@ export type OptionMetadata =
   | OptionMetadataType<OptionType.STRING_POSITIONAL, string>
   | OptionMetadataType<OptionType.BOOLEAN_STRING, boolean | string>
   | OptionMetadataType<OptionType.BOOLEAN_NUMBER, boolean | number>
-  | OptionMetadataType<OptionType.ARRAY, string[]>
+  | OptionMetadataType<OptionType.ARRAY, any[]>
   | OptionMetadataType<OptionType.OBJECT, any>;
 
 export function Option(
@@ -94,6 +96,34 @@ export interface PluginContext {
   rootPath: string;
   usageModel?: UsageModel;
   globalAsyncIO?: boolean;
+  fetchMock?: MockAgent;
+  queueEventDispatcher: QueueEventDispatcher;
+  queueBroker: QueueBroker;
+  // Cache shared between all mounted instances of this plugin within a
+  // Miniflare instance. Cleared after all `beforeReload()` hooks have executed.
+  // Used by the Durable Objects plugin to ensure single instances of objects
+  // across mounts.
+  sharedCache: Map<string, unknown>;
+}
+
+export interface TypedMap<ValueMap extends Record<string, unknown>> {
+  clear(): void;
+  delete(key: keyof ValueMap): boolean;
+  forEach(
+    callback: (
+      value: ValueOf<ValueMap>,
+      key: keyof ValueMap,
+      map: this
+    ) => void,
+    thisArg?: any
+  ): void;
+  get<Key extends keyof ValueMap>(key: Key): ValueMap[Key] | undefined;
+  has(key: keyof ValueMap): boolean;
+  set<Key extends keyof ValueMap>(key: Key, value: ValueMap[Key]): void;
+  keys(): IterableIterator<keyof ValueMap>;
+  values(): IterableIterator<ValueOf<ValueMap>>;
+  entries(): IterableIterator<[keyof ValueMap, ValueOf<ValueMap>]>;
+  [Symbol.iterator](): IterableIterator<[keyof ValueMap, ValueOf<ValueMap>]>;
 }
 
 export abstract class Plugin<Options extends Context = never> {

@@ -13,81 +13,61 @@ order: 6
 - [Using Streams](https://developers.cloudflare.com/workers/learning/using-streams)
 - [Web Crypto Reference](https://developers.cloudflare.com/workers/runtime-apis/web-crypto)
 
-Miniflare supports the following Web Standards in its sandbox:
+## Mocking Outbound `fetch` Requests
 
-- **Console:** `console.*`
-- **Timers:** `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`,
-  `queueMicrotask`, `AbortSignal.timeout`, `scheduler.wait`
-- **Base64:** `atob`, `btoa`
-- **Web Crypto**: `crypto.getRandomValues`, `crypto.randomUUID`,
-  `crypto.subtle.*` (with support for `MD5` digests and `NODE-ED25519`
-  signatures), `crypto.DigestStream`
-- **Encoding:** `TextEncoder`, `TextDecoder`
-- **Fetch:** `fetch`, `Headers` (including
-  [non-standard `getAll` method](https://developers.cloudflare.com/workers/runtime-apis/headers#differences)),
-  `Request`, `Response`, `FormData`, `Blob`, `File`, `URL`, `URLPattern`,
-  `URLSearchParams` (powered by [`undici`](https://github.com/nodejs/undici/))
-- **Streams:** `ByteLengthQueuingStrategy`, `CountQueuingStrategy`,
-  `ReadableByteStreamController`, `ReadableStream`, `ReadableStreamBYOBReader`
-  (including non-standard `readAtLeast` method), `ReadableStreamBYOBRequest`,
-  `ReadableStreamDefaultController`, `ReadableStreamDefaultReader`,
-  `TransformStream`, `TransformStreamDefaultController`, `WritableStream`,
-  `WritableStreamDefaultController`, `WritableStreamDefaultWriter`,
-  `FixedLengthStream`, `CompressionStream`, `DecompressionStream`
-- **Events:** `Event`, `EventTarget`, `AbortController`, `AbortSignal`
-- **Event Types:** `fetch`, `scheduled`, `unhandledrejection`,
-  `rejectionhandled`
-- **Misc:** `structuredClone`, `navigator`
+When using the API, Miniflare allows you to substitute custom `Response`s for
+`fetch()` calls using `undici`'s
+[`MockAgent` API](https://undici.nodejs.org/#/docs/api/MockAgent?id=mockagentgetorigin).
+This is useful for testing workers that make HTTP requests to other services. To
+enable `fetch` mocking, create a
+[`MockAgent`](https://undici.nodejs.org/#/docs/api/MockAgent?id=mockagentgetorigin)
+using the `createFetchMock()` function, then set this using the `fetchMock`
+option. If you're using the
+[🤹 Jest Environment](/testing/jest#mocking-outbound-fetch-requests), use the
+global `getMiniflareFetchMock()` function to obtain a correctly set-up
+[`MockAgent`](https://undici.nodejs.org/#/docs/api/MockAgent?id=mockagentgetorigin).
+
+```js
+import { Miniflare, createFetchMock } from "miniflare";
+
+// Create `MockAgent` and connect it to the `Miniflare` instance
+const fetchMock = createFetchMock();
+const mf = new Miniflare({
+  modules: true,
+  script: `
+  export default {
+    async fetch(request, env, ctx) {
+      const res = await fetch("https://example.com/thing");
+      const text = await res.text();
+      return new Response(\`response:\${text}\`);
+    }
+  }
+  `,
+  fetchMock,
+});
+
+// Throw when no matching mocked request is found
+// (see https://undici.nodejs.org/#/docs/api/MockAgent?id=mockagentdisablenetconnect)
+fetchMock.disableNetConnect();
+
+// Mock request to https://example.com/thing
+// (see https://undici.nodejs.org/#/docs/api/MockAgent?id=mockagentgetorigin)
+const origin = fetchMock.get("https://example.com");
+// (see https://undici.nodejs.org/#/docs/api/MockPool?id=mockpoolinterceptoptions)
+origin
+  .intercept({ method: "GET", path: "/thing" })
+  .reply(200, "Mocked response!");
+
+const res = await mf.dispatchFetch("http://localhost:8787/");
+console.log(await res.text()); // "response:Mocked response!"
+```
 
 ## Subrequests
 
-To match the behaviour of the Workers runtime, Miniflare limits you to
-[50 subrequests per request](https://developers.cloudflare.com/workers/platform/limits#account-plan-limits).
-Each call to `fetch()`, each URL in a redirect chain, and each call to a Cache
-API method (`put()`/`match()`/`delete()`) counts as a subrequest.
-
-If needed, the subrequest limit to be customised using the
-`MINIFLARE_SUBREQUEST_LIMIT` environment variable. Setting this to a negative
-number disables the limit. Setting this to 0 disables subrequests.
-
-```sh
-$ MINIFLARE_SUBREQUEST_LIMIT=100 miniflare
-```
-
-## Frozen Time
-
-To match the
-[behaviour of the Workers runtime](https://developers.cloudflare.com/workers/learning/security-model/#step-1-disallow-timers-and-multi-threading),
-Miniflare will always return the time of last I/O from `new Date()` and
-`Date.now()`.
-
-This behaviour can be disabled by setting the `actualTime` option, which may be
-useful for performance testing. Note that the Miniflare
-[🤹 Jest Environment](/testing/jest) automatically enables this option.
-
-import ConfigTabs from "../components/mdx/config-tabs";
-
-<ConfigTabs>
-
-```sh
-$ miniflare --actual-time
-```
-
-```toml
----
-filename: wrangler.toml
----
-[miniflare]
-actual_time = true
-```
-
-```js
-const mf = new Miniflare({
-  actualTime: true,
-});
-```
-
-</ConfigTabs>
+Miniflare does not support limiting the amount of
+[subrequests](https://developers.cloudflare.com/workers/platform/limits#account-plan-limits).
+Please keep this in mind if you make a large amount of subrequests from your
+Worker.
 
 ## Global Functionality Limits
 
@@ -97,38 +77,6 @@ some functionality, such as asynchronous I/O (`fetch`, Cache API, KV), timeouts
 (`setTimeout`, `setInterval`), and generating cryptographically-secure random
 values (`crypto.getRandomValues`, `crypto.subtle.generateKey`), can only be
 performed while handling a request, not in the global scope.
-
-This behaviour can be disabled by setting the `globalAsyncIO`, `globalTimers`
-and `globalRandom` options respectively, which may be useful for tests or
-libraries that need async I/O for setup during local development. Note that the
-Miniflare [🤹 Jest Environment](/testing/jest) automatically enables these
-options.
-
-<ConfigTabs>
-
-```sh
-$ miniflare --global-async-io --global-timers --global-random
-```
-
-```toml
----
-filename: wrangler.toml
----
-[miniflare]
-global_async_io = true
-global_timers = true
-glboal_random = true
-```
-
-```js
-const mf = new Miniflare({
-  globalAsyncIO: true,
-  globalTimers: true,
-  globalRandom: true,
-});
-```
-
-</ConfigTabs>
 
 KV namespaces and caches returned from `Miniflare#getKVNamespace()` and
 `Miniflare#getCaches()` are unaffected by this limit, so they can still be used
@@ -203,7 +151,6 @@ values created without the constructor inside the sandbox.
 
 ```js
 const mf = new Miniflare({
-  globals: { Error },
   modules: true,
   script: `
     export default {

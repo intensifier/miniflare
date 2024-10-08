@@ -2,19 +2,37 @@ import assert from "assert";
 import fs from "fs/promises";
 import path from "path";
 import { text } from "stream/consumers";
-import type { CompressionStream, DecompressionStream } from "stream/web";
-import { CorePlugin, Request, Response, Scheduler } from "@miniflare/core";
+import type {
+  CompressionStream,
+  DecompressionStream,
+  ReadableWritablePair,
+  Transformer,
+} from "stream/web";
+import { ReadableStream, TransformStream, WritableStream } from "stream/web";
+import {
+  CorePlugin,
+  IdentityTransformStream,
+  Request,
+  Response,
+  Scheduler,
+} from "@miniflare/core";
+import { QueueBroker } from "@miniflare/queues";
 import {
   Compatibility,
+  LogLevel,
   NoOpLog,
   PluginContext,
+  QueueEventDispatcher,
   RequestContext,
   STRING_SCRIPT_PATH,
 } from "@miniflare/shared";
 import {
+  TestLog,
   logPluginOptions,
   parsePluginArgv,
   parsePluginWranglerConfig,
+  triggerPromise,
+  unusable,
   useServer,
   useTmp,
   utf8Encode,
@@ -25,8 +43,17 @@ import { File, FormData } from "undici";
 const log = new NoOpLog();
 const compat = new Compatibility();
 const rootPath = process.cwd();
-const ctx: PluginContext = { log, compat, rootPath, globalAsyncIO: true };
-
+const queueBroker = new QueueBroker();
+const queueEventDispatcher: QueueEventDispatcher = async (_batch) => {};
+const ctx: PluginContext = {
+  log,
+  compat,
+  rootPath,
+  queueBroker,
+  queueEventDispatcher,
+  globalAsyncIO: true,
+  sharedCache: unusable(),
+};
 test("CorePlugin: parses options from argv", (t) => {
   let options = parsePluginArgv(CorePlugin, [
     "script.js",
@@ -159,7 +186,11 @@ test("CorePlugin: parses options from wrangler config", async (t) => {
         },
       },
       route: "miniflare.dev/*",
-      routes: ["dev.miniflare.dev/*"],
+      routes: [
+        "dev.miniflare.dev/*",
+        { pattern: "dev_with_zone_id.miniflare.dev/*", zone_id: "" },
+        { pattern: "dev_with_zone_name.miniflare.dev/*", zone_name: "" },
+      ],
       usage_model: "unbound",
       miniflare: {
         upstream: "https://miniflare.dev",
@@ -167,11 +198,16 @@ test("CorePlugin: parses options from wrangler config", async (t) => {
         update_check: false,
         mounts: { api: "./api", site: "./site@dev" },
         route: "http://localhost:8787/*",
-        routes: ["miniflare.mf:8787/*"],
+        routes: [
+          "miniflare.mf:8787/*",
+          { pattern: "dev_with_zone_id.miniflare.mf:8787/*", zone_id: "" },
+          { pattern: "dev_with_zone_name.miniflare.mf:8787/*", zone_name: "" },
+        ],
         global_async_io: true,
         global_timers: true,
         global_random: true,
         actual_time: true,
+        inaccurate_cpu: true,
       },
     },
     configDir
@@ -196,6 +232,7 @@ test("CorePlugin: parses options from wrangler config", async (t) => {
     upstream: "https://miniflare.dev",
     watch: true,
     debug: undefined,
+    fetchMock: undefined,
     verbose: undefined,
     updateCheck: false,
     repl: undefined,
@@ -220,14 +257,19 @@ test("CorePlugin: parses options from wrangler config", async (t) => {
     routes: [
       "miniflare.dev/*",
       "dev.miniflare.dev/*",
+      "dev_with_zone_id.miniflare.dev/*",
+      "dev_with_zone_name.miniflare.dev/*",
       "http://localhost:8787/*",
       "miniflare.mf:8787/*",
+      "dev_with_zone_id.miniflare.mf:8787/*",
+      "dev_with_zone_name.miniflare.mf:8787/*",
     ],
     logUnhandledRejections: undefined,
     globalAsyncIO: true,
     globalTimers: true,
     globalRandom: true,
     actualTime: true,
+    inaccurateCpu: true,
   });
   // Check build upload dir defaults to dist
   options = parsePluginWranglerConfig(
@@ -237,6 +279,15 @@ test("CorePlugin: parses options from wrangler config", async (t) => {
   );
   t.is(options.scriptPath, path.resolve(configDir, "dist", "script.js"));
   t.is(options.routes, undefined);
+  // Check live_reload implies watch
+  options = parsePluginWranglerConfig(CorePlugin, {
+    miniflare: { live_reload: true },
+  });
+  t.true(options.watch);
+  options = parsePluginWranglerConfig(CorePlugin, {
+    miniflare: { live_reload: false },
+  });
+  t.is(options.watch, undefined);
 });
 test("CorePlugin: logs options", (t) => {
   let logs = logPluginOptions(CorePlugin, {
@@ -264,6 +315,7 @@ test("CorePlugin: logs options", (t) => {
     globalTimers: true,
     globalRandom: true,
     actualTime: true,
+    inaccurateCpu: true,
   });
   t.deepEqual(logs, [
     // script is OptionType.NONE so omitted
@@ -287,6 +339,7 @@ test("CorePlugin: logs options", (t) => {
     "Allow Global Timers: true",
     "Allow Global Secure Random: true",
     "Actual Time: true",
+    "Inaccurate CPU Time Measurements: true",
   ]);
   // Check logs default wrangler config/package paths
   logs = logPluginOptions(CorePlugin, {
@@ -308,7 +361,13 @@ test("CorePlugin: logs options", (t) => {
 });
 
 test("CorePlugin: setup: includes web standards", async (t) => {
-  const plugin = new CorePlugin(ctx);
+  const plugin = new CorePlugin({
+    ...ctx,
+    compat: new Compatibility(undefined, [
+      "streams_enable_constructors",
+      "transformstream_enable_standard_constructor",
+    ]),
+  });
   const { globals } = await plugin.setup();
   assert(globals);
 
@@ -340,22 +399,30 @@ test("CorePlugin: setup: includes web standards", async (t) => {
   t.is(typeof globals.URLSearchParams, "function");
   t.is(typeof globals.URLPattern, "function");
 
+  t.is(typeof globals.ReadableStream, "function");
+  t.is(typeof globals.WritableStream, "function");
+  t.is(typeof globals.TransformStream, "function");
+
+  t.is(typeof globals.ReadableStreamBYOBReader, "function");
+  t.is(typeof globals.ReadableStreamDefaultReader, "function");
+  t.is(typeof globals.WritableStreamDefaultWriter, "function");
+
   t.is(typeof globals.ByteLengthQueuingStrategy, "function");
   t.is(typeof globals.CountQueuingStrategy, "function");
+
   t.is(typeof globals.ReadableByteStreamController, "function");
-  t.is(typeof globals.ReadableStream, "function");
-  t.is(typeof globals.ReadableStreamBYOBReader, "function");
   t.is(typeof globals.ReadableStreamBYOBRequest, "function");
   t.is(typeof globals.ReadableStreamDefaultController, "function");
-  t.is(typeof globals.ReadableStreamDefaultReader, "function");
-  t.is(typeof globals.TransformStream, "function");
-  t.is(typeof globals.TransformStreamDefaultController, "function");
-  t.is(typeof globals.WritableStream, "function");
   t.is(typeof globals.WritableStreamDefaultController, "function");
-  t.is(typeof globals.WritableStreamDefaultWriter, "function");
+  t.is(typeof globals.TransformStreamDefaultController, "function");
+
+  t.is(typeof globals.IdentityTransformStream, "function");
   t.is(typeof globals.FixedLengthStream, "function");
+
   t.is(typeof globals.CompressionStream, "function");
   t.is(typeof globals.DecompressionStream, "function");
+  t.is(typeof globals.TextEncoderStream, "function");
+  t.is(typeof globals.TextDecoderStream, "function");
 
   t.is(typeof globals.Event, "function");
   t.is(typeof globals.EventTarget, "function");
@@ -459,7 +526,7 @@ test("CorePlugin: setup: fetch refuses unknown protocols only if compatibility f
   const compat = new Compatibility(undefined, [
     "fetch_refuses_unknown_protocols",
   ]);
-  plugin = new CorePlugin({ log, compat, rootPath, globalAsyncIO: true });
+  plugin = new CorePlugin({ ...ctx, compat });
   globals = (await plugin.setup()).globals;
   await t.throwsAsync(async () => globals?.fetch(upstream), {
     instanceOf: TypeError,
@@ -468,13 +535,13 @@ test("CorePlugin: setup: fetch refuses unknown protocols only if compatibility f
 });
 test("CorePlugin: setup: fetch throws outside request handler unless globalAsyncIO set", async (t) => {
   const upstream = (await useServer(t, (req, res) => res.end("upstream"))).http;
-  let plugin = new CorePlugin({ log, compat, rootPath });
+  let plugin = new CorePlugin({ ...ctx, globalAsyncIO: false });
   let { globals } = await plugin.setup();
   await t.throwsAsync(globals?.fetch(upstream), {
     instanceOf: Error,
     message: /^Some functionality, such as asynchronous I\/O/,
   });
-  plugin = new CorePlugin({ log, compat, rootPath, globalAsyncIO: true });
+  plugin = new CorePlugin({ ...ctx, globalAsyncIO: true });
   globals = (await plugin.setup()).globals;
   await globals?.fetch(upstream);
 });
@@ -494,7 +561,7 @@ test("CorePlugin: setup: Request parses files in FormData as File objects only i
   const compat = new Compatibility(undefined, [
     "formdata_parser_supports_files",
   ]);
-  plugin = new CorePlugin({ log, compat, rootPath });
+  plugin = new CorePlugin({ ...ctx, compat });
   CompatRequest = (await plugin.setup()).globals?.Request;
   req = new CompatRequest("http://localhost", {
     method: "POST",
@@ -517,7 +584,7 @@ test("CorePlugin: setup: Response parses files in FormData as File objects only 
   const compat = new Compatibility(undefined, [
     "formdata_parser_supports_files",
   ]);
-  plugin = new CorePlugin({ log, compat, rootPath });
+  plugin = new CorePlugin({ ...ctx, compat });
   CompatResponse = (await plugin.setup()).globals?.Response;
   res = new CompatResponse(formData);
   resFormData = await res.formData();
@@ -529,7 +596,7 @@ test("CorePlugin: setup: includes navigator only if compatibility flag enabled",
   t.is(globals?.navigator, undefined);
 
   const compat = new Compatibility(undefined, ["global_navigator"]);
-  plugin = new CorePlugin({ log, compat, rootPath });
+  plugin = new CorePlugin({ ...ctx, compat });
   globals = (await plugin.setup()).globals;
   t.is(globals?.navigator.userAgent, "Cloudflare-Workers");
 });
@@ -549,6 +616,318 @@ test("CorePlugin: setup: uses actual time if option enabled", async (t) => {
     await new Promise((resolve) => setTimeout(resolve, 100));
     t.not(DateImpl.now(), previous);
   });
+});
+
+test("CorePlugin: nodejs_compat compatibility flag includes Node.js modules", async (t) => {
+  let compat = new Compatibility(undefined, ["nodejs_compat"]);
+  let plugin = new CorePlugin({ ...ctx, compat });
+  let modules = (await plugin.setup()).additionalModules!;
+  const names = Object.keys(modules).sort();
+  t.deepEqual(names, [
+    "node:assert",
+    "node:async_hooks",
+    "node:buffer",
+    "node:events",
+    "node:util",
+  ]);
+
+  compat = new Compatibility(undefined, ["nodejs_compat", "experimental"]);
+  plugin = new CorePlugin({ ...ctx, compat });
+  modules = (await plugin.setup()).additionalModules!;
+  const experimentalNames = Object.keys(modules).filter(
+    (name) => !names.includes(name)
+  );
+  t.deepEqual(experimentalNames, []);
+
+  // We're using Node's implementations of these modules' exports, so don't
+  // bother testing their functionality. Instead, just check we've got the
+  // same export types as `workerd`.
+
+  function exportTypes(name: string): Record<string, string> {
+    return Object.fromEntries(
+      Object.entries(modules[name]).map(([key, value]) => [key, typeof value])
+    );
+  }
+
+  t.deepEqual(exportTypes("node:assert"), {
+    AssertionError: "function",
+    deepEqual: "function",
+    deepStrictEqual: "function",
+    default: "function",
+    doesNotMatch: "function",
+    doesNotReject: "function",
+    doesNotThrow: "function",
+    equal: "function",
+    fail: "function",
+    ifError: "function",
+    match: "function",
+    notDeepEqual: "function",
+    notDeepStrictEqual: "function",
+    notEqual: "function",
+    notStrictEqual: "function",
+    ok: "function",
+    rejects: "function",
+    strict: "function",
+    strictEqual: "function",
+    throws: "function",
+  });
+  t.deepEqual(exportTypes("node:async_hooks"), {
+    AsyncLocalStorage: "function",
+    AsyncResource: "function",
+    default: "object",
+  });
+  t.deepEqual(exportTypes("node:buffer"), {
+    Buffer: "function",
+    SlowBuffer: "function",
+    constants: "object",
+    default: "object",
+    kMaxLength: "number",
+    kStringMaxLength: "number",
+  });
+  t.deepEqual(exportTypes("node:events"), {
+    EventEmitter: "function",
+    // Miniflare's minimum support Node version is `16.13.0`, but
+    // `EventEmitterAsyncResource` was only added in `16.14.0`:
+    // https://nodejs.org/api/events.html#class-eventseventemitterasyncresource-extends-eventemitter
+    EventEmitterAsyncResource: process.versions.node.startsWith("16.13.")
+      ? "undefined"
+      : "function",
+    captureRejectionSymbol: "symbol",
+    default: "function",
+    defaultMaxListeners: "number",
+    errorMonitor: "symbol",
+    getEventListeners: "function",
+    listenerCount: "function",
+    on: "function",
+    once: "function",
+    setMaxListeners: "function",
+  });
+  t.deepEqual(exportTypes("node:util"), {
+    _extend: "function",
+    callbackify: "function",
+    default: "object",
+    format: "function",
+    inherits: "function",
+    promisify: "function",
+    types: "object",
+  });
+});
+
+// Test stream constructors
+test("CorePlugin: setup: ReadableStream/WriteableStream constructors only enabled if compatibility flag enabled", async (t) => {
+  // Check without "streams_enable_constructors" compatibility flag (should throw)
+  let plugin = new CorePlugin(ctx);
+  let globals = (await plugin.setup()).globals!;
+
+  let ReadableStreamImpl: typeof ReadableStream = globals.ReadableStream;
+  await t.throws(
+    () => {
+      new ReadableStreamImpl({
+        start(controller) {
+          controller.enqueue("chunk");
+          controller.close();
+        },
+      });
+    },
+    {
+      instanceOf: Error,
+      message:
+        "To use the new ReadableStream() constructor, enable the streams_enable_constructors feature flag.",
+    }
+  );
+
+  let WritableStreamImpl: typeof WritableStream = globals.WritableStream;
+  await t.throws(
+    () => {
+      new WritableStreamImpl({ write: (chunk) => t.fail(chunk) });
+    },
+    {
+      instanceOf: Error,
+      message:
+        "To use the new WritableStream() constructor, enable the streams_enable_constructors feature flag.",
+    }
+  );
+
+  // Check with "streams_enable_constructors" compatibility flag
+  plugin = new CorePlugin({
+    ...ctx,
+    compat: new Compatibility(undefined, ["streams_enable_constructors"]),
+  });
+  globals = (await plugin.setup()).globals!;
+
+  ReadableStreamImpl = globals.ReadableStream;
+  const readable = new ReadableStreamImpl({
+    start(controller) {
+      controller.enqueue("chunk");
+      controller.close();
+    },
+  });
+  t.is(await text(readable as any), "chunk");
+
+  WritableStreamImpl = globals.WritableStream;
+  const [trigger, promise] = triggerPromise<any>();
+  const writable = new WritableStreamImpl({ write: (chunk) => trigger(chunk) });
+  const writer = writable.getWriter();
+  await writer.write("chunk");
+  await writer.close();
+  t.is(await promise, "chunk");
+});
+test("CorePlugin: setup: TransformStream accepts custom transformer only if compatibility flags enabled", async (t) => {
+  async function writeThrough<T>(
+    stream: ReadableWritablePair<T>,
+    chunks: T[]
+  ): Promise<T[]> {
+    const writer = stream.writable.getWriter();
+    for (const chunk of chunks) {
+      // noinspection ES6MissingAwait
+      void writer.write(chunk);
+    }
+    // noinspection ES6MissingAwait
+    void writer.close();
+
+    const result: T[] = [];
+    for await (const chunk of stream.readable) result.push(chunk);
+    return result;
+  }
+
+  const upperCaseTransformer: Transformer<string, string> = {
+    transform(chunk, controller) {
+      controller.enqueue(chunk.toUpperCase());
+    },
+  };
+
+  // Check without any flags
+  // (should behave like `IdentityTransformStream`, and warn if transformer passed)
+  const log = new TestLog();
+  let plugin = new CorePlugin({ ...ctx, log });
+  let globals = (await plugin.setup()).globals!;
+  let TransformStreamImpl: typeof TransformStream = globals.TransformStream;
+
+  let stream = new TransformStreamImpl();
+  t.true(stream instanceof IdentityTransformStream);
+  t.deepEqual(log.logsAtLevel(LogLevel.WARN), []);
+  t.deepEqual(await writeThrough(stream, [new Uint8Array([1, 2, 3])]), [
+    new Uint8Array([1, 2, 3]),
+  ]);
+
+  stream = new TransformStreamImpl(upperCaseTransformer);
+  t.true(stream instanceof IdentityTransformStream);
+  t.deepEqual(log.logsAtLevel(LogLevel.WARN), [
+    "To use the new TransformStream() constructor with a custom transformer, enable the transformstream_enable_standard_constructor feature flag.",
+  ]);
+  t.deepEqual(await writeThrough(stream, [new Uint8Array([1, 2, 3])]), [
+    new Uint8Array([1, 2, 3]),
+  ]);
+
+  // Check with just "streams_enable_constructors" compatibility flag
+  // (should behave like `IdentityTransformStream`, and warn if transformer passed)
+  log.logs = [];
+  let compat = new Compatibility(undefined, ["streams_enable_constructors"]);
+  plugin = new CorePlugin({ ...ctx, log, compat });
+  globals = (await plugin.setup()).globals!;
+  TransformStreamImpl = globals.TransformStream;
+
+  stream = new TransformStreamImpl();
+  t.true(stream instanceof IdentityTransformStream);
+  t.deepEqual(log.logsAtLevel(LogLevel.WARN), []);
+  t.deepEqual(await writeThrough(stream, [new Uint8Array([1, 2, 3])]), [
+    new Uint8Array([1, 2, 3]),
+  ]);
+
+  stream = new TransformStreamImpl(upperCaseTransformer);
+  t.true(stream instanceof IdentityTransformStream);
+  t.deepEqual(log.logsAtLevel(LogLevel.WARN), [
+    "To use the new TransformStream() constructor with a custom transformer, enable the transformstream_enable_standard_constructor feature flag.",
+  ]);
+  t.deepEqual(await writeThrough(stream, [new Uint8Array([1, 2, 3])]), [
+    new Uint8Array([1, 2, 3]),
+  ]);
+
+  // Check with just "transformstream_enable_standard_constructor" compatibility flag
+  // (should throw, with and without passed transformer)
+  log.logs = [];
+  compat = new Compatibility(undefined, [
+    "transformstream_enable_standard_constructor",
+  ]);
+  plugin = new CorePlugin({ ...ctx, log, compat });
+  globals = (await plugin.setup()).globals!;
+  TransformStreamImpl = globals.TransformStream;
+
+  await t.throws(() => new TransformStreamImpl(), {
+    instanceOf: Error,
+    message:
+      "To use the new TransformStream() constructor, enable the streams_enable_constructors feature flag.",
+  });
+  await t.throws(() => new TransformStreamImpl(upperCaseTransformer), {
+    instanceOf: Error,
+    message:
+      "To use the new TransformStream() constructor, enable the streams_enable_constructors feature flag.",
+  });
+
+  // Check with both flags
+  log.logs = [];
+  compat = new Compatibility(undefined, [
+    "streams_enable_constructors",
+    "transformstream_enable_standard_constructor",
+  ]);
+  plugin = new CorePlugin({ ...ctx, log, compat });
+  globals = (await plugin.setup()).globals!;
+  TransformStreamImpl = globals.TransformStream;
+
+  stream = new TransformStreamImpl();
+  t.false(stream instanceof IdentityTransformStream);
+  t.deepEqual(log.logsAtLevel(LogLevel.WARN), []);
+  t.deepEqual(await writeThrough(stream, ["a", "b", "c"]), ["a", "b", "c"]);
+
+  stream = new TransformStreamImpl(upperCaseTransformer);
+  t.false(stream instanceof IdentityTransformStream);
+  t.deepEqual(log.logsAtLevel(LogLevel.WARN), []);
+  t.deepEqual(await writeThrough(stream, ["a", "b", "c"]), ["A", "B", "C"]);
+});
+test("CorePlugin: setup: only includes stream controllers if compatibility flags enabled", async (t) => {
+  // Check without any flags
+  let plugin = new CorePlugin(ctx);
+  let globals = (await plugin.setup()).globals!;
+  t.is(typeof globals.ReadableByteStreamController, "undefined");
+  t.is(typeof globals.ReadableStreamBYOBRequest, "undefined");
+  t.is(typeof globals.ReadableStreamDefaultController, "undefined");
+  t.is(typeof globals.WritableStreamDefaultController, "undefined");
+  t.is(typeof globals.TransformStreamDefaultController, "undefined");
+
+  // Check with just "streams_enable_constructors" compatibility flag
+  let compat = new Compatibility(undefined, ["streams_enable_constructors"]);
+  plugin = new CorePlugin({ ...ctx, compat });
+  globals = (await plugin.setup()).globals!;
+  t.is(typeof globals.ReadableByteStreamController, "function");
+  t.is(typeof globals.ReadableStreamBYOBRequest, "function");
+  t.is(typeof globals.ReadableStreamDefaultController, "function");
+  t.is(typeof globals.WritableStreamDefaultController, "function");
+  t.is(typeof globals.TransformStreamDefaultController, "undefined");
+
+  // Check with just "transformstream_enable_standard_constructor" compatibility flag
+  compat = new Compatibility(undefined, [
+    "transformstream_enable_standard_constructor",
+  ]);
+  plugin = new CorePlugin({ ...ctx, compat });
+  globals = (await plugin.setup()).globals!;
+  t.is(typeof globals.ReadableByteStreamController, "undefined");
+  t.is(typeof globals.ReadableStreamBYOBRequest, "undefined");
+  t.is(typeof globals.ReadableStreamDefaultController, "undefined");
+  t.is(typeof globals.WritableStreamDefaultController, "undefined");
+  t.is(typeof globals.TransformStreamDefaultController, "undefined");
+
+  // Check with both flags
+  compat = new Compatibility(undefined, [
+    "streams_enable_constructors",
+    "transformstream_enable_standard_constructor",
+  ]);
+  plugin = new CorePlugin({ ...ctx, compat });
+  globals = (await plugin.setup()).globals!;
+  t.is(typeof globals.ReadableByteStreamController, "function");
+  t.is(typeof globals.ReadableStreamBYOBRequest, "function");
+  t.is(typeof globals.ReadableStreamDefaultController, "function");
+  t.is(typeof globals.WritableStreamDefaultController, "function");
+  t.is(typeof globals.TransformStreamDefaultController, "function");
 });
 
 // Test standards with basic-Miniflare and Node implementations
@@ -662,7 +1041,7 @@ test("CorePlugin: setup: loads script from package.json in default location", as
   const scriptPath = path.join(tmp, "script.js");
   await fs.writeFile(scriptPath, "console.log(42)");
   const plugin = new CorePlugin(
-    { log, compat, rootPath: tmp },
+    { ...ctx, rootPath: tmp },
     { packagePath: true }
   );
 
@@ -692,7 +1071,7 @@ test("CorePlugin: setup: loads script from package.json in custom location", asy
   await fs.writeFile(scriptPath, "console.log('custom')");
 
   const plugin = new CorePlugin(
-    { log, compat, rootPath: tmp },
+    { ...ctx, rootPath: tmp },
     // Should resolve packagePath relative to rootPath
     { packagePath: "package.custom.json" }
   );
@@ -735,7 +1114,7 @@ test("CorePlugin: setup: loads script from explicit path", async (t) => {
   const scriptPath = path.join(tmp, "script.js");
   await fs.writeFile(scriptPath, "console.log(42)");
   const plugin = new CorePlugin(
-    { log, compat, rootPath: tmp },
+    { ...ctx, rootPath: tmp },
     {
       // Should resolve scriptPath relative to rootPath
       scriptPath: "script.js",

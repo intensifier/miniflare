@@ -1,17 +1,23 @@
 import assert from "assert";
 import { Request } from "@miniflare/core";
 import type { FetchEvent } from "@miniflare/core";
-import { Compatibility, NoOpLog, PluginContext } from "@miniflare/shared";
+import { QueueBroker } from "@miniflare/queues";
+import {
+  Compatibility,
+  NoOpLog,
+  PluginContext,
+  QueueEventDispatcher,
+} from "@miniflare/shared";
 import {
   noop,
   triggerPromise,
+  unusable,
   useMiniflare,
   useServer,
 } from "@miniflare/shared-test";
 import {
   CloseEvent,
   MessageEvent,
-  WebSocket,
   WebSocketPair,
   WebSocketPlugin,
 } from "@miniflare/web-sockets";
@@ -20,8 +26,17 @@ import test from "ava";
 const log = new NoOpLog();
 const compat = new Compatibility();
 const rootPath = process.cwd();
-const ctx: PluginContext = { log, compat, rootPath, globalAsyncIO: true };
-
+const queueBroker = new QueueBroker();
+const queueEventDispatcher: QueueEventDispatcher = async (_batch) => {};
+const ctx: PluginContext = {
+  log,
+  compat,
+  rootPath,
+  queueBroker,
+  queueEventDispatcher,
+  globalAsyncIO: true,
+  sharedCache: unusable(),
+};
 test("WebSocketPlugin: setup: includes WebSocket stuff in globals", (t) => {
   const plugin = new WebSocketPlugin(ctx);
   const globals = plugin.setup().globals!;
@@ -35,12 +50,7 @@ test("WebSocketPlugin: setup: fetch refuses unknown protocols if compatibility f
   const compat = new Compatibility(undefined, [
     "fetch_refuses_unknown_protocols",
   ]);
-  const plugin = new WebSocketPlugin({
-    log,
-    compat,
-    rootPath,
-    globalAsyncIO: true,
-  });
+  const plugin = new WebSocketPlugin({ ...ctx, compat });
   const { globals } = await plugin.setup();
   const upstream = (await useServer(t, (req, res) => res.end("upstream"))).http;
   upstream.protocol = "ftp:";
@@ -51,33 +61,15 @@ test("WebSocketPlugin: setup: fetch refuses unknown protocols if compatibility f
 });
 test("WebSocketPlugin: setup: fetch throws outside request handler unless globalAsyncIO set", async (t) => {
   const upstream = (await useServer(t, (req, res) => res.end("upstream"))).http;
-  let plugin = new WebSocketPlugin({ log, compat, rootPath });
+  let plugin = new WebSocketPlugin({ ...ctx, globalAsyncIO: false });
   let { globals } = await plugin.setup();
   await t.throwsAsync(globals?.fetch(upstream), {
     instanceOf: Error,
     message: /^Some functionality, such as asynchronous I\/O/,
   });
-  plugin = new WebSocketPlugin({ log, compat, rootPath, globalAsyncIO: true });
+  plugin = new WebSocketPlugin({ ...ctx, globalAsyncIO: true });
   globals = (await plugin.setup()).globals;
   await globals?.fetch(upstream);
-});
-test("WebSocketPlugin: setup: blocks direct WebSocket construction", (t) => {
-  const plugin = new WebSocketPlugin(ctx);
-  const WebSocketProxy: typeof WebSocket = plugin.setup().globals!.WebSocket;
-  t.throws(() => new WebSocketProxy(), {
-    instanceOf: Error,
-    message:
-      "Failed to construct 'WebSocket': the constructor is not implemented.",
-  });
-  // @ts-expect-error construction without new should also throw
-  t.throws(() => WebSocketProxy(), {
-    instanceOf: Error,
-    message:
-      "Failed to construct 'WebSocket': the constructor is not implemented.",
-  });
-  // Check we can still use it for instanceof checking
-  const pair = new WebSocketPair();
-  t.true(pair[0] instanceof WebSocketProxy);
 });
 
 test("WebSocketPlugin: fetch, reload, dispose: closes WebSockets", async (t) => {

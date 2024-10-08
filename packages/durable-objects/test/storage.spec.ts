@@ -12,7 +12,6 @@ import {
 import {
   InputGate,
   OutputGate,
-  Storage,
   StoredValueMeta,
   nonCircularClone,
   viewToArray,
@@ -35,7 +34,9 @@ import anyTest, {
 import { alarmStore, testKey } from "./object";
 
 interface Context {
-  backing: Storage;
+  // We need synchronous access to storage for `sync()` tests, so require
+  // in-memory storage.
+  backing: MemoryStorage;
   storage: DurableObjectStorage;
 }
 
@@ -153,12 +154,14 @@ test("get: gets multiple keys", async (t) => {
   await backing.put("key1", storedValue("value1"));
   await backing.put("key2", storedValue("value2"));
   await backing.put("key3", storedValue("value3"));
+  // Results should be always be returned in lexicographic order:
+  // https://github.com/cloudflare/miniflare/issues/393
   const expected = new Map([
     ["key1", "value1"],
     ["key2", "value2"],
     ["key3", "value3"],
   ]);
-  t.deepEqual(await storage.get(["key1", "key2", "key3"]), expected);
+  t.deepEqual(await storage.get(["key2", "key3", "key1"]), expected);
 });
 test("get: gets multiple keys with complex values", async (t) => {
   const { backing, storage } = t.context;
@@ -874,8 +877,14 @@ test("list: sorts lexicographically", async (t) => {
   // https://github.com/cloudflare/miniflare/issues/235
   const { storage } = t.context;
   await storage.put({ "!": {}, ", ": {} });
-  const keys = Array.from((await storage.list()).keys());
+  let keys = Array.from((await storage.list()).keys());
   t.deepEqual(keys, ["!", ", "]);
+
+  // https://github.com/cloudflare/miniflare/issues/380
+  await storage.deleteAll();
+  await storage.put({ Z: 0, "\u{1D655}": 1, "\uFF3A": 2 });
+  keys = Array.from((await storage.list()).keys());
+  t.deepEqual(keys, ["Z", "\uFF3A", "\u{1D655}"]);
 });
 test("list: closes input gate unless allowConcurrency", async (t) => {
   const { storage } = t.context;
@@ -1304,6 +1313,84 @@ test("transaction: waits for un-awaited writes before committing", async (t) => 
   });
   t.is(await storage.get("key"), "value");
 });
+test("transaction: performs operations in program order", async (t) => {
+  // https://github.com/cloudflare/miniflare/issues/344
+  const { storage } = t.context;
+  await storage.transaction((txn) => {
+    void txn.delete("key");
+    void txn.put("key", "value");
+    return Promise.resolve();
+  });
+  t.is(await storage.get("key"), "value"); // not `undefined`
+});
+
+test("sync: waits for writes to be synchronised with storage", async (t) => {
+  const { backing, storage } = t.context;
+
+  // Check `sync()` waits for `put()`s
+  // noinspection ES6MissingAwait
+  void storage.put("key1", "value1");
+  let syncPromise: Promise<void> | undefined = storage.sync();
+  // `syncPromise` shouldn't resolve until all pending flushes have completed,
+  // including those performed with `allowUnconfirmed`
+  // noinspection ES6MissingAwait
+  void storage.put("key2", "value2", { allowUnconfirmed: true });
+
+  // Note `getMaybeExpired()` is synchronous in `MemoryStorage`
+  t.is(backing.getMaybeExpired("key1"), undefined);
+  t.is(backing.getMaybeExpired("key2"), undefined);
+  await syncPromise;
+  t.not(backing.getMaybeExpired("key1"), undefined);
+  t.not(backing.getMaybeExpired("key2"), undefined);
+
+  // Check `sync()` waits for `delete()`s
+  // noinspection ES6MissingAwait
+  void storage.delete("key1");
+  // noinspection ES6MissingAwait
+  void storage.delete("key2", { allowUnconfirmed: true });
+  t.not(backing.getMaybeExpired("key1"), undefined);
+  t.not(backing.getMaybeExpired("key2"), undefined);
+  await storage.sync();
+  t.is(backing.getMaybeExpired("key1"), undefined);
+  t.is(backing.getMaybeExpired("key2"), undefined);
+
+  // Check `sync()` waits for `deleteAll()`s
+  await storage.put("key1", "value1");
+  // noinspection ES6MissingAwait
+  void storage.deleteAll();
+  t.not(backing.getMaybeExpired("key1"), undefined);
+  await storage.sync();
+  t.is(backing.getMaybeExpired("key1"), undefined);
+
+  // Check `sync()` waits for `setAlarm()`s
+  // noinspection ES6MissingAwait
+  void storage.setAlarm(Date.now() + 60_000);
+  t.is(backing.getMaybeExpired("__MINIFLARE_ALARMS__"), undefined);
+  await storage.sync();
+  t.not(backing.getMaybeExpired("__MINIFLARE_ALARMS__"), undefined);
+
+  // Check `sync()` waits for `deleteAlarm()`s
+  // noinspection ES6MissingAwait
+  void storage.deleteAlarm();
+  t.not(backing.getMaybeExpired("__MINIFLARE_ALARMS__"), undefined);
+  await storage.sync();
+  t.is(backing.getMaybeExpired("__MINIFLARE_ALARMS__"), undefined);
+
+  // Check `sync()` waits for `transaction()`s
+  syncPromise = undefined;
+  // noinspection ES6MissingAwait
+  void storage.transaction(async (txn) => {
+    // Check calling `sync()` while transaction running waits for transaction
+    // to complete. Note this closure may be called multiple times, but we only
+    // want to call `sync()` on the first run, hence `??=`.
+    syncPromise ??= storage.sync();
+    await setTimeout();
+    await txn.put("key1", "value2");
+  });
+  t.is(backing.getMaybeExpired("key1"), undefined);
+  await syncPromise;
+  t.not(backing.getMaybeExpired("key1"), undefined);
+});
 
 test("hides implementation details", (t) => {
   const { storage } = t.context;
@@ -1316,6 +1403,7 @@ test("hides implementation details", (t) => {
     "list",
     "put",
     "setAlarm",
+    "sync",
     "transaction",
   ]);
 });

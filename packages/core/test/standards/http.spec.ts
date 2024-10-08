@@ -1,12 +1,18 @@
 import assert from "assert";
 import http from "http";
 import { text } from "stream/consumers";
-import { ReadableStream, TransformStream, WritableStream } from "stream/web";
+import {
+  ReadableStream,
+  ReadableStreamDefaultReader,
+  TransformStream,
+  WritableStream,
+} from "stream/web";
 import { URL } from "url";
 import {
   Body,
   IncomingRequestCfProperties,
   Request,
+  RequestInitCfProperties,
   Response,
   _getBodyLength,
   _getURLList,
@@ -38,7 +44,7 @@ import {
   waitsForOutputGate,
 } from "@miniflare/shared-test";
 import { WebSocketPair } from "@miniflare/web-sockets";
-import test, { Macro } from "ava";
+import test, { Macro, ThrowsExpectation } from "ava";
 import {
   Request as BaseRequest,
   Response as BaseResponse,
@@ -57,6 +63,18 @@ async function byobReadFirstChunk(body: ReadableStream<Uint8Array> | null) {
   const reader = body.getReader({ mode: "byob" });
   const result = await reader.read(new Uint8Array(32));
   return utf8Decode(result.value);
+}
+
+function unimplementedExpectation(
+  klass: "Request" | "Response",
+  property: keyof Request | keyof Response
+): ThrowsExpectation {
+  return {
+    instanceOf: Error,
+    message: `Failed to get the '${String(
+      property
+    )}' property on '${klass}': the property is not implemented.`,
+  };
 }
 
 test('Headers: getAll: throws if key not "Set-Cookie"', (t) => {
@@ -88,24 +106,6 @@ test("Headers: getAll: returns separated Set-Cookie values", (t) => {
   t.deepEqual(headers.getAll("set-CoOkiE"), [cookie1, cookie2, cookie3]);
 });
 
-test("_isByteStream: determines if a ReadableStream is a byte stream", (t) => {
-  const regularStream = new ReadableStream({
-    pull(controller) {
-      controller.enqueue(new Uint8Array([1, 2, 3]));
-      controller.close();
-    },
-  });
-  const byteStream = new ReadableStream({
-    type: "bytes",
-    pull(controller) {
-      controller.enqueue(new Uint8Array([1, 2, 3]));
-      controller.close();
-    },
-  });
-  t.false(_isByteStream(regularStream));
-  t.true(_isByteStream(byteStream));
-});
-
 // These tests also implicitly test withInputGating
 test("Body: body isn't input gated by default", async (t) => {
   const inputGate = new InputGate();
@@ -128,21 +128,6 @@ test("Body: same body instance is always returned", (t) => {
   const body = new Body(new BaseResponse("body"));
   t.not(body.body, null);
   t.is(body.body, body.body);
-});
-test("Body: reuses byte stream if not input gated", (t) => {
-  const bodyStream = new ReadableStream({
-    type: "bytes",
-    pull(controller) {
-      controller.enqueue(utf8Encode("chunk"));
-      controller.close();
-    },
-  });
-
-  let res = new Response(bodyStream);
-  t.is(res.body, bodyStream);
-
-  res = withInputGating(new Response(bodyStream));
-  t.not(res.body, bodyStream);
 });
 test("Body: body isn't locked until read from", async (t) => {
   const res = new Response("body");
@@ -191,6 +176,26 @@ test("Body: can pause, resume and cancel body stream", async (t) => {
   reader.releaseLock();
   reader = body.getReader();
   result = await reader.read();
+  t.true(result.done);
+  t.is(result.value, undefined);
+});
+test("Body: can cancel body directly", async (t) => {
+  const chunks = ["123", "456", "789"];
+  const bodyStream = new ReadableStream({
+    pull(controller) {
+      const chunk = chunks.shift();
+      if (chunk) {
+        controller.enqueue(utf8Encode(chunk));
+      } else {
+        controller.close();
+      }
+    },
+  });
+  const { body } = new Response(bodyStream);
+  assert(body);
+
+  await body.cancel();
+  const result = await body.getReader().read();
   t.true(result.done);
   t.is(result.value, undefined);
 });
@@ -340,6 +345,26 @@ test("Body: formData: parses files as File objects by default", async (t) => {
   t.is(await file.text(), "file contents");
   t.is(file.name, "test.txt");
 });
+test("Body: formData: preserves path of File objects", async (t) => {
+  const body = new Body(
+    new BaseResponse(
+      [
+        "--boundary",
+        'Content-Disposition: form-data; name="key"; filename="directory/test.txt"',
+        "Content-Type: text/plain",
+        "",
+        "file contents",
+        "--boundary--",
+      ].join("\r\n"),
+      { headers: { "content-type": 'multipart/form-data;boundary="boundary"' } }
+    )
+  );
+  const formData = await body.formData();
+  const file = formData.get("key");
+  assert(file instanceof File);
+  t.is(await file.text(), "file contents");
+  t.is(file.name, "directory/test.txt");
+});
 test("Body: formData: parses files as strings if option set", async (t) => {
   let body = new Body(
     new BaseResponse(
@@ -377,7 +402,30 @@ test("Body: formData: respects Content-Transfer-Encoding header for base64 encod
   const formData = await body.formData();
   t.is(formData.get("key"), "test");
 });
-
+test("Body: formData: throw error on missing boundary in Content-Type header", async (t) => {
+  // Check with multipart/form-data Content-Type
+  const body = new Body(
+    new BaseResponse(["second value2", "--boundary--"].join("\r\n"), {
+      headers: { "content-type": "multipart/form-data" },
+    })
+  );
+  await t.throwsAsync(body.formData(), {
+    instanceOf: TypeError,
+    message: "Multipart: Boundary not found",
+  });
+});
+test("Body: formData: throw error on unsupported Content-Type header", async (t) => {
+  // Check with application/json Content-Type
+  const body = new Body(
+    new BaseResponse(["second value2", "--boundary--"].join("\r\n"), {
+      headers: { "content-type": "application/json" },
+    })
+  );
+  await t.throwsAsync(body.formData(), {
+    instanceOf: TypeError,
+    message: "Unsupported content type: application/json",
+  });
+});
 test("Request: constructing from BaseRequest doesn't create new BaseRequest unless required", (t) => {
   // Check properties of Request are same as BaseRequest if not RequestInit passed
   const controller = new AbortController();
@@ -396,18 +444,9 @@ test("Request: constructing from BaseRequest doesn't create new BaseRequest unle
   // Bodies are different, as we create a readable byte stream for each Request
   t.not(req.body, base.body);
 
-  t.is(req.cache, base.cache);
-  t.is(req.credentials, base.credentials);
-  t.is(req.destination, base.destination);
-  t.is(req.integrity, base.integrity);
   t.is(req.method, base.method);
-  t.is(req.cache, base.cache);
-  t.is(req.mode, base.mode);
   t.is(req.redirect, base.redirect);
-  t.is(req.cache, base.cache);
-  t.is(req.referrerPolicy, base.referrerPolicy);
   t.is(req.url, base.url);
-  t.is(req.keepalive, base.keepalive);
   t.is(req.signal, base.signal);
 
   // Check new BaseRequest created if RequestInit passed
@@ -434,6 +473,27 @@ test("Request: can construct new Request from existing Request", async (t) => {
   t.is(await req2.text(), "body");
   t.deepEqual(req2.cf, cf);
 });
+test("Request: can construct new Request with stream body", async (t) => {
+  let stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(utf8Encode("chunk1"));
+      controller.close();
+    },
+  });
+  let req = new Request("http://localhost", { method: "POST", body: stream });
+  t.is(await req.text(), "chunk1");
+
+  // Check again with byte stream
+  stream = new ReadableStream({
+    type: "bytes",
+    start(controller) {
+      controller.enqueue(utf8Encode("chunk2"));
+      controller.close();
+    },
+  });
+  req = new Request("http://localhost", { method: "POST", body: stream });
+  t.is(await req.text(), "chunk2");
+});
 test("Request: supports non-standard properties", (t) => {
   const req = new Request("http://localhost", {
     method: "POST",
@@ -443,6 +503,29 @@ test("Request: supports non-standard properties", (t) => {
   t.deepEqual(req.cf, cf);
   // Check cf has been cloned
   t.not(req.cf, cf);
+});
+test("Request: cf defaults to input.cf", (t) => {
+  const req = new Request("http://localhost", {
+    method: "POST",
+    cf,
+  });
+  const req2 = new Request(req);
+  t.deepEqual(req.cf, req2.cf);
+  // Check cf has been cloned
+  t.not(req.cf, req2.cf);
+});
+test("Request: init.cf overrides input.cf", (t) => {
+  const req = new Request("http://localhost", {
+    method: "POST",
+    cf,
+  });
+  const req2 = new Request(req, {
+    cf: {
+      cacheKey: "test",
+    },
+  });
+  t.notDeepEqual(req.cf, req2.cf);
+  t.is((req2.cf as RequestInitCfProperties).cacheKey, "test");
 });
 test("Request: doesn't detach ArrayBuffers", async (t) => {
   // Check with ArrayBuffer
@@ -475,6 +558,40 @@ test("Request: clones non-standard properties", (t) => {
   t.is(req3.method, "POST");
   t.deepEqual(req3.cf, cf);
   t.not(req3.cf, req2.cf);
+});
+test("Request: clones stream bodies", async (t) => {
+  let stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(utf8Encode("chunk1"));
+      controller.close();
+    },
+  });
+  const init = { method: "POST", body: stream };
+  const initClone = { ...init };
+  let req = new Request("http://localhost", init);
+  t.deepEqual(init, initClone);
+  let clone = req.clone();
+  assert(req.body !== null && clone.body !== null);
+  t.true(_isByteStream(req.body));
+  t.true(_isByteStream(clone.body));
+  t.is(await req.text(), "chunk1");
+  t.is(await clone.text(), "chunk1");
+
+  // Check again with byte stream
+  stream = new ReadableStream({
+    type: "bytes",
+    start(controller) {
+      controller.enqueue(utf8Encode("chunk2"));
+      controller.close();
+    },
+  });
+  req = new Request("http://localhost", { method: "POST", body: stream });
+  clone = req.clone();
+  assert(req.body !== null && clone.body !== null);
+  t.true(_isByteStream(req.body));
+  t.true(_isByteStream(clone.body));
+  t.is(await req.text(), "chunk2");
+  t.is(await clone.text(), "chunk2");
 });
 test("Request: can be input gated", async (t) => {
   const req = withInputGating(
@@ -585,6 +702,55 @@ test("Request: can use byob reader when cloning", async (t) => {
   t.is(await byobReadFirstChunk(clone.body), "body");
   t.is(await byobReadFirstChunk(req.body), "body");
 });
+test("Request: should be locked when attaching a reader", async (t) => {
+  const req = new Request("http://localhost", { method: "POST", body: "body" });
+  // noinspection SuspiciousTypeOfGuard
+  t.true(req instanceof Body);
+  // noinspection SuspiciousTypeOfGuard
+  assert(req.body instanceof ReadableStream);
+  t.false(req.body.locked);
+  const reader = req.body.getReader();
+  // noinspection SuspiciousTypeOfGuard
+  assert(reader instanceof ReadableStreamDefaultReader);
+  t.true(req.body.locked);
+});
+test("Request: should reset bodyStream when body is cloned", async (t) => {
+  const reqBody = new ArrayBuffer(10);
+  const req = new Request("http://localhost", {
+    method: "POST",
+    body: reqBody,
+  });
+  // noinspection SuspiciousTypeOfGuard
+  t.true(req instanceof Body);
+  const bodyStream = req.body;
+  assert(bodyStream instanceof ReadableStream);
+  // Clone the request. undici will change the `body.stream` to a new clone.
+  const cloneReq = req.clone();
+  t.deepEqual(await cloneReq.arrayBuffer(), reqBody);
+  // We can loop over body. This is what http-server writeResponse() does.
+  if (req.body) {
+    for await (const chunk of req.body) {
+      // noinspection SuspiciousTypeOfGuard
+      assert(chunk instanceof Uint8Array);
+    }
+  }
+  // Expect that the internal bodyStream also changed
+  t.not(bodyStream, req.body);
+});
+test("Request: access to unimplemented properties throws error", async (t) => {
+  const req = new Request("https://a");
+  t.throws(() => req.context, unimplementedExpectation("Request", "context"));
+  t.throws(() => req.mode, unimplementedExpectation("Request", "mode"));
+  t.throws(
+    () => req.credentials,
+    unimplementedExpectation("Request", "credentials")
+  );
+  t.throws(
+    () => req.integrity,
+    unimplementedExpectation("Request", "integrity")
+  );
+  t.throws(() => req.cache, unimplementedExpectation("Request", "cache"));
+});
 
 test("withImmutableHeaders: makes Request's headers immutable", (t) => {
   const req = new Request("http://localhost");
@@ -675,7 +841,7 @@ test("Response: supports non-standard properties", (t) => {
 });
 test("Response: encodeBody defaults to auto", (t) => {
   const res = new Response(null);
-  t.is(res.encodeBody, "auto");
+  t.is(res.encodeBody, "automatic");
 });
 test("Response: requires status 101 for WebSocket response", (t) => {
   const pair = new WebSocketPair();
@@ -730,6 +896,37 @@ test("Response: clones non-standard properties", async (t) => {
   t.is(await res.text(), "body");
   t.is(await res2.text(), "body");
   t.is(await res3.text(), "body");
+});
+test("Response: clones stream bodies", async (t) => {
+  let stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(utf8Encode("chunk1"));
+      controller.close();
+    },
+  });
+  let res = new Response(stream);
+  let clone = res.clone();
+  assert(res.body !== null && clone.body !== null);
+  t.true(_isByteStream(res.body));
+  t.true(_isByteStream(clone.body));
+  t.is(await res.text(), "chunk1");
+  t.is(await clone.text(), "chunk1");
+
+  // Check again with byte stream
+  stream = new ReadableStream({
+    type: "bytes",
+    start(controller) {
+      controller.enqueue(utf8Encode("chunk2"));
+      controller.close();
+    },
+  });
+  res = new Response(stream);
+  clone = res.clone();
+  assert(res.body !== null && clone.body !== null);
+  t.true(_isByteStream(res.body));
+  t.true(_isByteStream(clone.body));
+  t.is(await res.text(), "chunk2");
+  t.is(await clone.text(), "chunk2");
 });
 test("Response: constructing from Response copies non-standard properties", (t) => {
   const pair = new WebSocketPair();
@@ -796,13 +993,12 @@ test("Response: Object.keys() returns getters", async (t) => {
     "body",
     "bodyUsed",
     "headers",
-    "encodeBody",
-    "webSocket",
-    "url",
-    "redirected",
     "ok",
-    "statusText",
+    "redirected",
     "status",
+    "statusText",
+    "url",
+    "webSocket",
   ];
   t.deepEqual(keys.sort(), expectedKeys.sort());
 });
@@ -843,13 +1039,45 @@ test("Response: can use byob reader when cloning", async (t) => {
   t.is(await byobReadFirstChunk(clone.body), "body");
   t.is(await byobReadFirstChunk(res.body), "body");
 });
-test("Response: type throws with unimplemented error", async (t) => {
+test("Response: should be locked when attaching a reader", async (t) => {
+  const res = new Response("body");
+  // noinspection SuspiciousTypeOfGuard
+  t.true(res instanceof Body);
+  // noinspection SuspiciousTypeOfGuard
+  assert(res.body instanceof ReadableStream);
+  t.false(res.body.locked);
+  const reader = res.body.getReader();
+  // noinspection SuspiciousTypeOfGuard
+  assert(reader instanceof ReadableStreamDefaultReader);
+  t.true(res.body.locked);
+});
+test("Response: should reset bodyStream when body is cloned", async (t) => {
+  const resBody = new ArrayBuffer(10);
+  const res = new Response(resBody);
+  // noinspection SuspiciousTypeOfGuard
+  t.true(res instanceof Body);
+  const bodyStream = res.body;
+  assert(bodyStream instanceof ReadableStream);
+  // Clone the response. undici will change the `body.stream` to a new clone.
+  const cloneRes = res.clone();
+  t.deepEqual(await cloneRes.arrayBuffer(), resBody);
+  // We can loop over body. This is what http-server writeResponse() does.
+  if (res.body) {
+    for await (const chunk of res.body) {
+      // noinspection SuspiciousTypeOfGuard
+      assert(chunk instanceof Uint8Array);
+    }
+  }
+  // Expect that the internal bodyStream also changed
+  t.not(bodyStream, res.body);
+});
+test("Response: access to unimplemented properties throws error", async (t) => {
   const res = new Response();
-  t.throws(() => res.type, {
-    instanceOf: Error,
-    message:
-      "Failed to get the 'type' property on 'Response': the property is not implemented.",
-  });
+  t.throws(() => res.type, unimplementedExpectation("Response", "type"));
+  t.throws(
+    () => res.useFinalUrl,
+    unimplementedExpectation("Response", "useFinalUrl")
+  );
 });
 
 test("withWaitUntil: adds wait until to (Base)Response", async (t) => {
@@ -1037,6 +1265,53 @@ test("fetch: removes default fetch headers from Request unless explicitly added"
     "user-agent": "miniflare-test3",
     "cf-ray": "ray3",
   });
+});
+test("fetch: accepts stream body", async (t) => {
+  const upstream = (await useServer(t, (req, res) => req.pipe(res))).http;
+
+  let stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(utf8Encode("chunk1"));
+      controller.close();
+    },
+  });
+  const init = { method: "POST", body: stream };
+  const initClone = { ...init };
+  let res = await fetch(upstream, init);
+  t.deepEqual(init, initClone);
+  t.is(await res.text(), "chunk1");
+
+  stream = new ReadableStream({
+    type: "bytes",
+    start(controller) {
+      controller.enqueue(utf8Encode("chunk2"));
+      controller.close();
+    },
+  });
+  res = await fetch(upstream, { method: "POST", body: stream });
+  t.is(await res.text(), "chunk2");
+});
+test("fetch: uses known content length if possible", async (t) => {
+  // https://github.com/cloudflare/miniflare/issues/522
+  const upstream = (
+    await useServer(t, (req, res) => {
+      res.end(String(req.headers["transfer-encoding"]));
+    })
+  ).http;
+
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(utf8Encode("chunk"));
+      controller.close();
+    },
+  });
+  const request = new Request("http://localhost", {
+    method: "POST",
+    headers: { "Content-Length": "5" },
+    body,
+  });
+  const res = await fetch(upstream, { method: "POST", body: request.body });
+  t.is(await res.text(), "undefined");
 });
 test('fetch: returns full Response for "manual" redirect', async (t) => {
   const upstream = (await useServer(t, redirectingServerListener)).http;
@@ -1304,5 +1579,35 @@ test("logResponse: logs waitUntil error", async (t) => {
   t.regex(
     message,
     /GET http:\/\/localhost 200 OK \(\d+.\d{2}ms, waitUntil: \d+.\d{2}ms\)/
+  );
+});
+test("logResponse: logs CPU time", async (t) => {
+  const log = new TestLog();
+
+  // Check without waitUntil
+  const toLog: Parameters<typeof logResponse>[1] = {
+    start: process.hrtime(),
+    startCpu: process.cpuUsage(),
+    method: "GET",
+    url: "http://localhost",
+    status: 404,
+  };
+  await logResponse(log, toLog);
+  let [level, message] = log.logs[0];
+  t.is(level, LogLevel.NONE);
+  t.regex(
+    message,
+    /GET http:\/\/localhost 404 Not Found \(\d+.\d{2}ms\) \(CPU: ~\d+.\d{2}ms\)/
+  );
+
+  // Check with waitUntil
+  log.logs = [];
+  toLog.waitUntil = Promise.all([Promise.resolve(42)]);
+  await logResponse(log, toLog);
+  [level, message] = log.logs[0];
+  t.is(level, LogLevel.NONE);
+  t.regex(
+    message,
+    /GET http:\/\/localhost 404 Not Found \(\d+.\d{2}ms, waitUntil: \d+.\d{2}ms\) \(CPU: ~\d+.\d{2}ms, waitUntil: ~\d+.\d{2}ms\)/
   );
 });

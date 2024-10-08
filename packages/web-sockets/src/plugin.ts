@@ -11,11 +11,8 @@ import {
   MessageEvent,
   WebSocket,
   WebSocketPair,
-  kClosed,
+  kClosedOutgoing,
 } from "./websocket";
-
-const constructError =
-  "Failed to construct 'WebSocket': the constructor is not implemented.";
 
 export class WebSocketPlugin extends Plugin {
   #webSockets = new Set<WebSocket>();
@@ -23,7 +20,10 @@ export class WebSocketPlugin extends Plugin {
 
   constructor(ctx: PluginContext) {
     super(ctx);
-    this.#upgradingFetch = createCompatFetch(ctx, upgradingFetch);
+    this.#upgradingFetch = createCompatFetch(
+      ctx,
+      upgradingFetch.bind(ctx.fetchMock)
+    );
   }
 
   setup(): SetupResult {
@@ -32,14 +32,7 @@ export class WebSocketPlugin extends Plugin {
         MessageEvent,
         CloseEvent,
         WebSocketPair,
-        WebSocket: new Proxy(WebSocket, {
-          construct() {
-            throw new Error(constructError);
-          },
-          apply() {
-            throw new Error(constructError);
-          },
-        }),
+        WebSocket,
         // This plugin will always be loaded after CorePlugin, so this overrides
         // the standard non-upgrading fetch
         fetch: this.fetch,
@@ -56,7 +49,7 @@ export class WebSocketPlugin extends Plugin {
   reload(): void {
     // Ensure all fetched web sockets are closed
     for (const ws of this.#webSockets) {
-      if (!ws[kClosed]) ws.close(1012, "Service Restart");
+      if (!ws[kClosedOutgoing]) ws.close(1012, "Service Restart");
     }
     this.#webSockets.clear();
   }

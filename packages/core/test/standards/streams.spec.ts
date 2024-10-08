@@ -1,13 +1,22 @@
 import assert from "assert";
-import { arrayBuffer } from "stream/consumers";
-import { ReadableStream, ReadableStreamBYOBReadResult } from "stream/web";
+import { arrayBuffer, text } from "stream/consumers";
+import {
+  ReadableStream,
+  ReadableStreamBYOBReadResult,
+  TransformStream,
+} from "stream/web";
 import {
   ArrayBufferViewConstructor,
   CompressionStream,
   DecompressionStream,
   FixedLengthStream,
+  IdentityTransformStream,
   Request,
   Response,
+  _isBodyStream,
+  _isByteStream,
+  _isDisturbedStream,
+  _isFixedLengthStream,
 } from "@miniflare/core";
 import { utf8Decode, utf8Encode } from "@miniflare/shared-test";
 import test, { Macro, ThrowsExpectation } from "ava";
@@ -50,6 +59,53 @@ async function* byobReadAtLeast<Ctor extends ArrayBufferViewConstructor>(
     // if (result.done) break;
   }
 }
+
+test("_isByteStream: determines if a ReadableStream is a byte stream", (t) => {
+  const regularStream = new ReadableStream({
+    pull(controller) {
+      controller.enqueue(new Uint8Array([1, 2, 3]));
+      controller.close();
+    },
+  });
+  const byteStream = new ReadableStream({
+    type: "bytes",
+    pull(controller) {
+      controller.enqueue(new Uint8Array([1, 2, 3]));
+      controller.close();
+    },
+  });
+  t.false(_isByteStream(regularStream));
+  t.true(_isByteStream(byteStream));
+});
+test("_isDisturbedStream: determines if a ReadableStream is disturbed", async (t) => {
+  const regularStream = new ReadableStream({
+    pull(controller) {
+      controller.enqueue(new Uint8Array([1, 2, 3]));
+      controller.enqueue("thing");
+      controller.close();
+    },
+  });
+  const byteStream = new ReadableStream({
+    type: "bytes",
+    pull(controller) {
+      controller.enqueue(new Uint8Array([1, 2, 3]));
+      controller.close();
+    },
+  });
+  t.false(_isDisturbedStream(regularStream));
+  t.false(_isDisturbedStream(byteStream));
+
+  // @ts-expect-error ReadableStream types are incompatible
+  await arrayBuffer(regularStream);
+  t.true(_isDisturbedStream(regularStream));
+
+  const reader = byteStream.getReader();
+  t.false(_isDisturbedStream(byteStream));
+  await reader.read();
+  t.true(_isDisturbedStream(byteStream));
+  await reader.releaseLock();
+  t.true(_isDisturbedStream(byteStream));
+});
 
 test("ReadableStreamBYOBReader: readAtLeast: reads at least n bytes", async (t) => {
   const stream = chunkedStream([[1, 2, 3], [4], [5, 6]]);
@@ -184,6 +240,176 @@ test("ReadableStreamBYOBReader: readAtLeast: throws if minimum number of bytes e
   });
 });
 
+test("ReadableStream: tee: returns byte streams when teeing byte stream", async (t) => {
+  // https://github.com/cloudflare/miniflare/issues/317
+  const stream = chunkedStream([[1, 2, 3]]);
+  t.true(_isByteStream(stream));
+  const [stream1, stream2] = stream.tee();
+  t.true(_isByteStream(stream1));
+  t.true(_isByteStream(stream2));
+
+  // Check detaching array buffers on one stream doesn't affect the other
+  // (note Response#body will detach chunks as reading)
+  // https://github.com/cloudflare/miniflare/issues/375
+  const body1 = await arrayBuffer(new Response(stream1).body as any);
+  const body2 = await arrayBuffer(new Response(stream2).body as any);
+  t.deepEqual(new Uint8Array(body1), new Uint8Array([1, 2, 3]));
+  t.deepEqual(new Uint8Array(body2), new Uint8Array([1, 2, 3]));
+});
+test("ReadableStream: tee: returns regular stream when teeing regular stream", async (t) => {
+  const stream = new ReadableStream<string>({
+    start(controller) {
+      controller.enqueue("value");
+      controller.close();
+    },
+  });
+  t.false(_isByteStream(stream));
+  const [stream1, stream2] = stream.tee();
+  t.false(_isByteStream(stream1));
+  t.false(_isByteStream(stream2));
+  t.is(await text(stream1 as any), "value");
+  t.is(await text(stream2 as any), "value");
+});
+test("ReadableStream: tee: returns known length streams when teeing known length streams", async (t) => {
+  const fixedLengthStream = new FixedLengthStream(3);
+  let [stream1, stream2] = fixedLengthStream.readable.tee();
+  t.true(_isFixedLengthStream(stream1));
+  t.true(_isFixedLengthStream(stream2));
+
+  const req = new Request("http://localhost", { method: "POST", body: "body" });
+  assert(req.body !== null);
+  [stream1, stream2] = req.body.tee();
+  t.true(_isBodyStream(stream1));
+  t.true(_isBodyStream(stream2));
+
+  const res = new Response("body");
+  assert(res.body !== null);
+  [stream1, stream2] = res.body.tee();
+  t.true(_isBodyStream(stream1));
+  t.true(_isBodyStream(stream2));
+});
+test("ReadableStream: tee: throws on illegal invocation", (t) => {
+  const stream = new ReadableStream<string>({
+    start(controller) {
+      controller.close();
+    },
+  });
+  // @ts-expect-error using comma expression to unbind this
+  // noinspection CommaExpressionJS
+  t.throws(() => (0, stream.tee)(), {
+    instanceOf: TypeError,
+    message: "Illegal invocation",
+  });
+});
+
+const identityMacro: Macro<[TransformStream]> = async (t, stream) => {
+  const { readable, writable } = stream;
+  const writer = writable.getWriter();
+  // noinspection ES6MissingAwait
+  void writer.write(new Uint8Array([1, 2]));
+  // noinspection ES6MissingAwait
+  void writer.write(new Uint8Array([3]));
+  // noinspection ES6MissingAwait
+  void writer.close();
+
+  const reader = readable.getReader();
+  t.deepEqual((await reader.read()).value, new Uint8Array([1, 2]));
+  t.deepEqual((await reader.read()).value, new Uint8Array([3]));
+  t.true((await reader.read()).done);
+};
+const identityByobMacro: Macro<[TransformStream]> = async (t, stream) => {
+  const { readable, writable } = stream;
+  const writer = writable.getWriter();
+  // noinspection ES6MissingAwait
+  void writer.write(new Uint8Array([1]));
+  // noinspection ES6MissingAwait
+  void writer.write(new Uint8Array([2, 3]));
+  // noinspection ES6MissingAwait
+  void writer.close();
+
+  const reads = byobReadAtLeast(readable, 3, 8, Uint8Array);
+
+  let value = (await reads.next()).value;
+  assert(value);
+  t.false(value.done);
+  t.deepEqual(value.value, new Uint8Array([1, 2, 3]));
+
+  value = (await reads.next()).value;
+  assert(value);
+  t.true(value.done);
+  t.deepEqual(value.value, new Uint8Array([]));
+};
+const identityStringChunkMacro: Macro<[TransformStream]> = async (
+  t,
+  stream
+) => {
+  const { readable, writable } = stream;
+  const writer = writable.getWriter();
+  // noinspection ES6MissingAwait
+  void writer.write(
+    "how much chunk would a chunk-chuck chuck if a chunk-chuck could chuck chunk?"
+  );
+
+  const reader = readable.getReader();
+  await t.throwsAsync(reader.read(), {
+    instanceOf: TypeError,
+    message:
+      "This TransformStream is being used as a byte stream, " +
+      "but received a string on its writable side. " +
+      "If you wish to write a string, you'll probably want to " +
+      "explicitly UTF-8-encode it with TextEncoder.",
+  });
+};
+const identityNonArrayChunkMacro: Macro<[TransformStream]> = async (
+  t,
+  stream
+) => {
+  const { readable, writable } = stream;
+  const writer = writable.getWriter();
+  // noinspection ES6MissingAwait
+  void writer.write(42);
+
+  const reader = readable.getReader();
+  await t.throwsAsync(reader.read(), {
+    instanceOf: TypeError,
+    message:
+      "This TransformStream is being used as a byte stream, " +
+      "but received an object of non-ArrayBuffer/ArrayBufferView " +
+      "type on its writable side.",
+  });
+};
+test(
+  "IdentityTransformStream: behaves as identity transform",
+  identityMacro,
+  new IdentityTransformStream()
+);
+test(
+  "IdentityTransformStream: permits BYOB reads",
+  identityByobMacro,
+  new IdentityTransformStream()
+);
+test(
+  "IdentityTransformStream: throws on string chunks",
+  identityStringChunkMacro,
+  new IdentityTransformStream()
+);
+test(
+  "IdentityTransformStream: throws on non-ArrayBuffer/ArrayBufferView chunks",
+  identityNonArrayChunkMacro,
+  new IdentityTransformStream()
+);
+test("IdentityTransformStream: doesn't throw on empty chunk write", async (t) => {
+  // https://github.com/cloudflare/miniflare/issues/374
+  const { readable, writable } = new IdentityTransformStream();
+  const writer = writable.getWriter();
+  // noinspection ES6MissingAwait
+  void writer.write(new Uint8Array());
+  // noinspection ES6MissingAwait
+  void writer.close();
+  const array = new Uint8Array(await arrayBuffer(readable as any));
+  t.deepEqual(array, new Uint8Array());
+});
+
 test("FixedLengthStream: requires non-negative integer expected length", (t) => {
   const expectations: ThrowsExpectation = {
     instanceOf: TypeError,
@@ -225,56 +451,26 @@ test("FixedLengthStream: throws if too few bytes written", async (t) => {
     message: "FixedLengthStream did not see all expected bytes before close().",
   });
 });
-test("FixedLengthStream: behaves as identity transform if just right number of bytes written", async (t) => {
-  const { readable, writable } = new FixedLengthStream(3);
-  const writer = writable.getWriter();
-  // noinspection ES6MissingAwait
-  void writer.write(new Uint8Array([1, 2]));
-  // noinspection ES6MissingAwait
-  void writer.write(new Uint8Array([3]));
-  // noinspection ES6MissingAwait
-  void writer.close();
-
-  const reader = readable.getReader();
-  t.deepEqual((await reader.read()).value, new Uint8Array([1, 2]));
-  t.deepEqual((await reader.read()).value, new Uint8Array([3]));
-  t.true((await reader.read()).done);
-});
-test("FixedLengthStream: throws on string chunks", async (t) => {
-  const { readable, writable } = new FixedLengthStream(5);
-  const writer = writable.getWriter();
-  // noinspection ES6MissingAwait
-  void writer.write(
-    // @ts-expect-error intentionally testing incorrect types
-    "how much chunk would a chunk-chuck chuck if a chunk-chuck could chuck chunk?"
-  );
-
-  const reader = readable.getReader();
-  await t.throwsAsync(reader.read(), {
-    instanceOf: TypeError,
-    message:
-      "This TransformStream is being used as a byte stream, " +
-      "but received a string on its writable side. " +
-      "If you wish to write a string, you'll probably want to " +
-      "explicitly UTF-8-encode it with TextEncoder.",
-  });
-});
-test("FixedLengthStream: throws on non-ArrayBuffer/ArrayBufferView chunks", async (t) => {
-  const { readable, writable } = new FixedLengthStream(5);
-  const writer = writable.getWriter();
-  // @ts-expect-error intentionally testing incorrect types
-  // noinspection ES6MissingAwait
-  void writer.write(42);
-
-  const reader = readable.getReader();
-  await t.throwsAsync(reader.read(), {
-    instanceOf: TypeError,
-    message:
-      "This TransformStream is being used as a byte stream, " +
-      "but received an object of non-ArrayBuffer/ArrayBufferView " +
-      "type on its writable side.",
-  });
-});
+test(
+  "FixedLengthStream: behaves as identity transform if just right number of bytes written",
+  identityMacro,
+  new FixedLengthStream(3)
+);
+test(
+  "FixedLengthStream: permits BYOB reads",
+  identityByobMacro,
+  new FixedLengthStream(3)
+);
+test(
+  "FixedLengthStream: throws on string chunks",
+  identityStringChunkMacro,
+  new FixedLengthStream(5)
+);
+test(
+  "FixedLengthStream: throws on non-ArrayBuffer/ArrayBufferView chunks",
+  identityNonArrayChunkMacro,
+  new FixedLengthStream(5)
+);
 function buildFixedLengthReadableStream(length: number) {
   const { readable, writable } = new FixedLengthStream(length);
   const writer = writable.getWriter();

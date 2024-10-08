@@ -11,12 +11,21 @@ export interface CompatibilityFeature {
 // will get a type error if they try to use an unsupported flag via the API,
 // and they won't be logged in the "Enabled Compatibility Flags" section.
 export type CompatibilityEnableFlag =
+  | "nodejs_compat"
+  | "streams_enable_constructors"
+  | "transformstream_enable_standard_constructor"
+  | "export_commonjs_default"
+  | "r2_list_honor_include"
   | "global_navigator"
   | "durable_object_fetch_requires_full_url"
   | "fetch_refuses_unknown_protocols"
   | "formdata_parser_supports_files"
-  | "html_rewriter_treats_esi_include_as_void_tag";
+  | "html_rewriter_treats_esi_include_as_void_tag"
+  | "experimental";
 export type CompatibilityDisableFlag =
+  | "streams_disable_constructors"
+  | "transformstream_disable_standard_constructor"
+  | "export_commonjs_namespace"
   | "no_global_navigator"
   | "durable_object_fetch_allows_relative_url"
   | "fetch_treats_unknown_protocols_as_http"
@@ -26,6 +35,28 @@ export type CompatibilityFlag =
   | CompatibilityDisableFlag;
 
 const FEATURES: CompatibilityFeature[] = [
+  {
+    enableFlag: "nodejs_compat",
+  },
+  {
+    defaultAsOf: "2022-11-30",
+    enableFlag: "streams_enable_constructors",
+    disableFlag: "streams_disable_constructors",
+  },
+  {
+    defaultAsOf: "2022-11-30",
+    enableFlag: "transformstream_enable_standard_constructor",
+    disableFlag: "transformstream_disable_standard_constructor",
+  },
+  {
+    defaultAsOf: "2022-10-31",
+    enableFlag: "export_commonjs_default",
+    disableFlag: "export_commonjs_namespace",
+  },
+  {
+    defaultAsOf: "2022-08-04",
+    enableFlag: "r2_list_honor_include",
+  },
   {
     defaultAsOf: "2022-03-21",
     enableFlag: "global_navigator",
@@ -48,6 +79,9 @@ const FEATURES: CompatibilityFeature[] = [
   },
   {
     enableFlag: "html_rewriter_treats_esi_include_as_void_tag",
+  },
+  {
+    enableFlag: "experimental",
   },
 ];
 

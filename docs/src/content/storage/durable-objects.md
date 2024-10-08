@@ -11,26 +11,6 @@ order: 1
 
 Specify Durable Objects to add to your environment as follows:
 
-import ConfigTabs from "../components/mdx/config-tabs";
-
-<ConfigTabs>
-
-```sh
-# Note Object1 and Object2 classes must be exported from the main script
-$ miniflare --do OBJECT1=Object1 --do OBJECT2=Object2 # or -o
-```
-
-```toml
----
-filename: wrangler.toml
----
-[durable_objects]
-bindings = [
-  # Object1 class must be exported from the main script
-  { name = "OBJECT1", class_name = "Object1" },
-]
-```
-
 ```js
 const mf = new Miniflare({
   modules: true,
@@ -53,32 +33,11 @@ const mf = new Miniflare({
 });
 ```
 
-</ConfigTabs>
-
 ## Persistence
 
 By default, Durable Object data is stored in memory. It will persist between
-reloads, but not CLI invocations or different `Miniflare` instances. To enable
-persistence to the file system or Redis, specify the Durable Object persistence
-option:
-
-<ConfigTabs>
-
-```sh
-$ miniflare --do-persist # Defaults to ./.mf/do
-$ miniflare --do-persist ./data/  # Custom path
-$ miniflare --do-persist redis://localhost:6379  # Redis server
-```
-
-```toml
----
-filename: wrangler.toml
----
-[miniflare]
-durable_objects_persist = true # Defaults to ./.mf/do
-durable_objects_persist = "./data/" # Custom path
-durable_objects_persist = "redis://localhost:6379" # Redis server
-```
+reloads, but not different `Miniflare` instances. To enable persistence to the
+file system or Redis, specify the Durable Object persistence option:
 
 ```js
 const mf = new Miniflare({
@@ -88,25 +47,8 @@ const mf = new Miniflare({
 });
 ```
 
-</ConfigTabs>
-
 When using the file system, each object instance will get its own directory
 within the Durable Object persistence directory.
-
-When using Redis, each key will be prefixed with the object name and instance.
-If you're using this with the API, make sure you call `dispose` on your
-`Miniflare` instance to close database connections.
-
-<Aside type="warning" header="Warning">
-
-Redis support is not included by default. You must install an optional peer
-dependency:
-
-```sh
-$ npm install -D @miniflare/storage-redis
-```
-
-</Aside>
 
 ## Validation
 
@@ -132,13 +74,12 @@ Like the real Workers runtime, Miniflare will throw errors when:
 
 ## Manipulating Outside Workers
 
-For testing, it can be useful to put/get data from Durable Object storage
-outside a worker. You can do this with the `getDurableObjectNamespace` and
-`getDurableObjectStorage` methods.
+For testing, it can be useful to make requests to your Durable Objects from
+outside a worker. You can do this with the `getDurableObjectNamespace` method.
 
 ```js
 ---
-highlight: [30,31,32,33,34,35,36,37,38]
+highlight: [28,29,30,31,32]
 ---
 import { Miniflare } from "miniflare";
 
@@ -153,7 +94,7 @@ const mf = new Miniflare({
 
     async fetch(request) {
       const url = new URL(request.url);
-      if(url.pathname === "/put") await this.storage.put("key", 1);
+      if (url.pathname === "/put") await this.storage.put("key", 1);
       return new Response((await this.storage.get("key")).toString());
     }
   }
@@ -166,8 +107,6 @@ const mf = new Miniflare({
   }
   `,
 });
-let res = await mf.dispatchFetch("http://localhost:8787/put");
-console.log(await res.text()); // "1"
 
 const ns = await mf.getDurableObjectNamespace("TEST_OBJECT");
 const id = ns.idFromName("test");
@@ -175,19 +114,15 @@ const stub = ns.get(id);
 const doRes = await stub.fetch("http://localhost:8787/put");
 console.log(await doRes.text()); // "1"
 
-const storage = await mf.getDurableObjectStorage(id);
-console.log(await storage.get("key")); // 1
-await storage.put("key", 2);
-
-res = await mf.dispatchFetch("http://localhost:8787/");
-console.log(await res.text()); // "2"
+const res = await mf.dispatchFetch("http://localhost:8787/");
+console.log(await res.text()); // "1"
 ```
 
 ## Using a Class Exported by Another Script
 
 Miniflare supports the `script_name` option for accessing Durable Objects
 exported by other scripts. This requires mounting the other worker as described
-in [🔌 Multiple Workers](/core/mount). With the following setup:
+in [🔌 Multiple Workers](/core/multiple-workers). With the following setup:
 
 ```js
 ---
@@ -227,11 +162,9 @@ export default {
 
 Miniflare can be configured to load `TestObject` from the `api` worker with:
 
-<ConfigTabs>
+import ConfigTabs from "../components/mdx/config-tabs";
 
-```sh
-$ miniflare --mount api=./api --do TEST_OBJECT=TestObject@api
-```
+<ConfigTabs>
 
 ```toml
 ---
@@ -239,27 +172,30 @@ filename: wrangler.toml
 ---
 [durable_objects]
 bindings = [
-  # script_name must be the same as in [miniflare.mounts]
   { name = "TEST_OBJECT", class_name = "TestObject", script_name = "api" },
 ]
-[miniflare.mounts]
-api = "./api"
 ```
 
 ```js
 const mf = new Miniflare({
-  durableObjects: {
-    // scriptName must be the same as in mounts
-    TEST_OBJECT: { className: "TestObject", scriptName: "api" },
-  },
-  mounts: { api: "./api" },
+  workers: [
+    {
+      name: "api",
+      durableObjects: {
+        // scriptName must be the same as in the connected worker
+        TEST_OBJECT: { className: "TestObject", scriptName: "api" },
+      },
+      modules: true,
+      scriptPath: "api/src/worker.mjs",
+    },
+  ],
 });
 ```
 
 </ConfigTabs>
 
-Mounted workers can access Durable Objects declared in other mounts or the
-parent worker, assuming it has a `name` set.
+Workers can access Durable Objects declared in the `workers` field assuming it
+has a `name` set.
 
 ## Internal Details
 

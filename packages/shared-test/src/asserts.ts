@@ -54,14 +54,41 @@ export function getObjectProperties<T>(obj: T): string[] {
     .sort();
 }
 
-export async function advancesTime(
+export async function advancesTime<T>(
   t: ExecutionContext,
-  closure: () => Promise<any>
+  closure: () => Promise<T>
 ) {
   const ctx = new RequestContext();
   const previous = ctx.currentTime;
   await setTimeout(50);
   t.is(ctx.currentTime, previous);
-  await ctx.runWith(closure);
+  const result = await ctx.runWith(closure);
   t.not(ctx.currentTime, previous);
+  return result;
+}
+
+export function unusable<T extends object>(): T {
+  return new Proxy({} as T, {
+    apply() {
+      throw new TypeError("Attempted to call unusable object");
+    },
+    construct() {
+      throw new TypeError("Attempted to construct unusable object");
+    },
+    deleteProperty(target, prop) {
+      throw new TypeError(
+        `Attempted to delete \"${String(prop)}\" on unusable object`
+      );
+    },
+    get(target, prop) {
+      throw new TypeError(
+        `Attempted to get \"${String(prop)}\" on unusable object`
+      );
+    },
+    set(target, prop) {
+      throw new TypeError(
+        `Attempted to set \"${String(prop)}\" on unusable object`
+      );
+    },
+  });
 }

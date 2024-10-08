@@ -1,17 +1,59 @@
+import assert from "assert";
 import path from "path";
-import ignore from "ignore";
+import { TextEncoder } from "util";
+import {
+  MessageChannel,
+  TransferListItem,
+  receiveMessageOnPort,
+} from "worker_threads";
+import picomatch from "picomatch";
+
+const encoder = new TextEncoder();
 
 export const numericCompare = new Intl.Collator(undefined, { numeric: true })
   .compare;
 
+export function arrayCompare<T extends any[] | NodeJS.TypedArray>(
+  a: T,
+  b: T
+): number {
+  const minLength = Math.min(a.length, b.length);
+  for (let i = 0; i < minLength; i++) {
+    const aElement = a[i];
+    const bElement = b[i];
+    if (aElement < bElement) return -1;
+    if (aElement > bElement) return 1;
+  }
+  return a.length - b.length;
+}
+
+// Compares x and y lexicographically using a UTF-8 collation
 export function lexicographicCompare(x: string, y: string): number {
-  if (x < y) return -1;
-  if (x === y) return 0;
-  return 1;
+  const xEncoded = encoder.encode(x);
+  const yEncoded = encoder.encode(y);
+  return arrayCompare(xEncoded, yEncoded);
 }
 
 export function nonCircularClone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value));
+}
+export interface StructuredSerializeOptions {
+  transfer?: ReadonlyArray<TransferListItem>;
+}
+// `structuredClone` implementation for Node < 17.0.0
+let channel: MessageChannel;
+export function structuredCloneImpl<T>(
+  value: T,
+  options?: StructuredSerializeOptions
+): T {
+  // https://github.com/nodejs/node/blob/71951a0e86da9253d7c422fa2520ee9143e557fa/lib/internal/structured_clone.js
+  channel ??= new MessageChannel();
+  channel.port1.unref();
+  channel.port2.unref();
+  channel.port1.postMessage(value, options?.transfer);
+  const message = receiveMessageOnPort(channel.port2);
+  assert(message !== undefined);
+  return message.message;
 }
 
 export function addAll<T>(set: Set<T>, values: Iterable<T>): void {
@@ -38,18 +80,33 @@ export function randomHex(digits = 8): string {
     .join("");
 }
 
+export const SITES_NO_CACHE_PREFIX = "$__MINIFLARE_SITES__$/";
+
 // Arbitrary string matcher, note RegExp adheres to this interface
 export interface Matcher {
   test(string: string): boolean;
   toString(): string;
 }
 
-export function globsToMatcher(globs?: string[]): Matcher {
-  const ign = ignore();
-  if (globs) ign.add(globs);
+export function globsToMatcher(globs: string[] = []): Matcher {
+  const matchGlobs: string[] = [];
+  const ignoreGlobs: string[] = [];
+  for (const glob of globs) {
+    if (glob.startsWith("!")) {
+      ignoreGlobs.push(glob.slice(1));
+    } else {
+      matchGlobs.push(glob);
+    }
+  }
+  const isMatch = picomatch(matchGlobs, {
+    dot: true,
+    bash: true,
+    contains: true,
+    ignore: ignoreGlobs,
+  });
   return {
-    test: (string) => ign.ignores(string),
-    toString: () => globs?.join(", ") ?? "",
+    test: (string) => isMatch(string),
+    toString: () => globs.join(", "),
   };
 }
 

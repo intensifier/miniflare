@@ -1,5 +1,5 @@
 ---
-order: 4
+order: 5
 ---
 
 # 🌐 Workers Sites
@@ -27,12 +27,6 @@ be ignored:
 import ConfigTabs from "../components/mdx/config-tabs";
 
 <ConfigTabs>
-
-```sh
-$ miniflare --site ./public # or -s
-$ miniflare --site ./public --site-include upload_dir
-$ miniflare --site ./public --site-exclude ignore_dir
-```
 
 ```toml
 ---
@@ -72,7 +66,7 @@ addEventListener("fetch", (event) => {
 
 When you enable Workers Sites, a read-only KV namespace, bound to
 `__STATIC_CONTENT`, is created using the file system (without key sanitisation)
-as its storage. An empty object, `{}`, is bound to `__STATIC_CONTENT_MANIFEST`.
-This tricks `@cloudflare/kv-asset-handler` into disabling edge caching, meaning
-the most up-to-date file is always loaded from disk. Miniflare also binds this
-empty object to the `__STATIC_CONTENT_MANIFEST` text module.
+as its storage. Each entry in the bound `__STATIC_CONTENT_MANIFEST` object
+contains a magic prefix that disables edge caching. This means the most
+up-to-date file are always loaded from disk. Miniflare also binds this object to
+the `__STATIC_CONTENT_MANIFEST` text module.

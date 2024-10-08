@@ -5,7 +5,6 @@ import http from "http";
 import https from "https";
 import net from "net";
 import { Transform, Writable } from "stream";
-import { ReadableStream } from "stream/web";
 import { URL } from "url";
 import zlib from "zlib";
 import {
@@ -16,6 +15,7 @@ import {
   Response,
   _getBodyLength,
   _headersFromIncomingRequest,
+  fetch,
   logResponse,
 } from "@miniflare/core";
 import { Log, prefixError, randomHex } from "@miniflare/shared";
@@ -61,37 +61,16 @@ export async function convertNodeRequest(
   const url = new URL(req.url ?? "", origin);
 
   let body: BodyInit | null = null;
-  if (req.method !== "GET" && req.method !== "HEAD") {
-    // Adapted from https://github.com/nodejs/undici/blob/ebea0f7084bb1efdb66c46409d1bfc87054b2870/lib/core/util.js#L269-L304
-    // to create a byte stream instead of a regular one. This means we don't
-    // create another "byte-TransformStream" later on to allow byob reads.
-    let iterator: AsyncIterableIterator<any>;
-    body = new ReadableStream({
-      type: "bytes",
-      start() {
-        iterator = req[Symbol.asyncIterator]();
-      },
-      async pull(controller) {
-        const { done, value } = await iterator.next();
-        if (done) {
-          queueMicrotask(() => {
-            controller.close();
-            // Not documented in MDN but if there's an ongoing request that's waiting,
-            // we need to tell it that there were 0 bytes delivered so that it unblocks
-            // and notices the end of stream.
-            // @ts-expect-error `byobRequest` has type `undefined` in `@types/node`
-            controller.byobRequest?.respond(0);
-          });
-        } else {
-          const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value);
-          controller.enqueue(new Uint8Array(buffer));
-        }
-      },
-      async cancel() {
-        await iterator.return?.();
-      },
-    });
-  }
+  // Previously, we performed an optimisation to convert this body to a "bytes"-
+  // stream, so we didn't have to do this later on when accessing the body in
+  // a Worker (request bodies must support BYOB reads). Since `undici@5.12.0`,
+  // cloning a body now invokes `structuredClone` on the underlying stream
+  // (https://github.com/nodejs/undici/pull/1697). Unfortunately, due to a bug
+  // in Node, byte streams cannot be `structuredClone`d
+  // (https://github.com/nodejs/undici/issues/1873,
+  // https://github.com/nodejs/node/pull/45955), leading to issues when
+  // attempting to clone incoming requests.
+  if (req.method !== "GET" && req.method !== "HEAD") body = req;
 
   // Add additional Cloudflare specific headers:
   // https://support.cloudflare.com/hc/en-us/articles/200170986-How-does-Cloudflare-handle-HTTP-Request-headers-
@@ -114,9 +93,12 @@ export async function convertNodeRequest(
   req.headers["cf-visitor"] ??= `{"scheme":"${proto}"}`;
   req.headers["host"] = url.host;
 
-  // Keep it to use later
+  // Store original `Accept-Encoding` for `request.cf.clientAcceptEncoding`
   const clientAcceptEncoding = req.headers["accept-encoding"];
-  // This should be fixed
+  // Only the `Set-Cookie` header is an array: https://nodejs.org/api/http.html#messageheaders
+  assert(!Array.isArray(clientAcceptEncoding));
+  // The Workers runtime will always set `Accept-Encoding` to `gzip`:
+  // https://github.com/cloudflare/miniflare/issues/180
   req.headers["accept-encoding"] = "gzip";
 
   // Build Headers object from request
@@ -135,6 +117,12 @@ export async function convertNodeRequest(
     // Incoming requests always have their redirect mode set to manual:
     // https://developers.cloudflare.com/workers/runtime-apis/request#requestinit
     redirect: "manual",
+    // Technically, we're constructing a Miniflare `Request` here, so we
+    // shouldn't be passing `duplex`. However, we only automatically set
+    // `duplex` when we pass a `ReadableStream` body, whereas in this case
+    // we're passing a `http.IncomingMessage`. `undici` converts any
+    // `AsyncIterable` to a stream, so this is fine.
+    duplex: body === null ? undefined : "half",
   });
   return { request, url };
 }
@@ -159,7 +147,8 @@ async function writeResponse(
       // @ts-expect-error getAll is added to the Headers prototype by
       // importing @miniflare/core
       headers["set-cookie"] = response.headers.getAll("set-cookie");
-    } else {
+    } else if (key !== "content-length") {
+      // Content-Length has special handling below
       headers[key] = value;
     }
   }
@@ -171,14 +160,14 @@ async function writeResponse(
   const contentLength =
     _getBodyLength(response) ??
     (contentLengthHeader === null ? null : parseInt(contentLengthHeader));
-  if (contentLength !== null) headers["content-length"] = contentLength;
+  if (contentLength !== null && !isNaN(contentLength)) {
+    headers["content-length"] = contentLength;
+  }
 
   // If a Content-Encoding is set, and the user hasn't encoded the body,
   // we're responsible for doing so.
   const encoders: Transform[] = [];
-  if (headers["content-encoding"] && response.encodeBody === "auto") {
-    // Content-Length will be wrong as it's for the decoded length
-    delete headers["content-length"];
+  if (headers["content-encoding"] && response.encodeBody === "automatic") {
     // Reverse of https://github.com/nodejs/undici/blob/48d9578f431cbbd6e74f77455ba92184f57096cf/lib/fetch/index.js#L1660
     const codings = headers["content-encoding"]
       .toString()
@@ -199,13 +188,17 @@ async function writeResponse(
         break;
       }
     }
+    if (encoders.length > 0) {
+      // Content-Length will be wrong as it's for the decoded length
+      delete headers["content-length"];
+    }
   }
 
   // Add live reload script if enabled, this isn't an already encoded
   // response, and it's HTML
   const liveReloadEnabled =
     liveReload &&
-    response.encodeBody === "auto" &&
+    response.encodeBody === "automatic" &&
     response.headers.get("content-type")?.toLowerCase().includes("text/html");
 
   // If Content-Length is specified, and we're live-reloading, we'll
@@ -252,8 +245,9 @@ export function createRequestListener<Plugins extends HTTPPluginSignatures>(
   mf: MiniflareCore<Plugins>
 ): RequestListener {
   return async (req, res) => {
-    const { HTTPPlugin } = await mf.getPlugins();
+    const { CorePlugin, HTTPPlugin } = await mf.getPlugins();
     const start = process.hrtime();
+    const startCpu = CorePlugin.inaccurateCpu ? process.cpuUsage() : undefined;
     const { request, url } = await convertNodeRequest(
       req,
       await HTTPPlugin.getRequestMeta(req)
@@ -279,11 +273,19 @@ export function createRequestListener<Plugins extends HTTPPluginSignatures>(
           url
         );
         status = 200;
+        res?.writeHead(status, { "Content-Type": "text/plain; charset=UTF-8" });
+        res?.end();
+      } else if (pathname.startsWith("/cdn-cgi/scripts/")) {
+        response = await fetch(new URL(pathname, "https://cloudflare.com"));
+        status = response.status;
+        if (res) {
+          await writeResponse(response, res, HTTPPlugin.liveReload, mf.log);
+        }
       } else {
         status = 404;
+        res?.writeHead(status, { "Content-Type": "text/plain; charset=UTF-8" });
+        res?.end();
       }
-      res?.writeHead(status, { "Content-Type": "text/plain; charset=UTF-8" });
-      res?.end();
     } else {
       try {
         response = await mf.dispatchFetch(request);
@@ -330,13 +332,19 @@ export function createRequestListener<Plugins extends HTTPPluginSignatures>(
     }
 
     assert(req.method && req.url);
-    await logResponse(mf.log, {
+    const logPromise = logResponse(mf.log, {
       start,
+      startCpu,
       method: req.method,
       url: req.url,
       status,
       waitUntil,
     });
+    // `res` will be undefined if we're calling this function in response to a
+    // WebSocket upgrade. In that case, we don't want to wait for `waitUntil`s
+    // to resolve, before we can use the returned `response`. So, only `await`
+    // if we've already written the `response` somewhere.
+    if (res !== undefined) await logPromise;
     return response;
   };
 }
@@ -367,7 +375,13 @@ export async function createServer<Plugins extends HTTPPluginSignatures>(
   const { WebSocketServer }: typeof import("ws") = require("ws");
 
   // Setup WebSocket servers
-  const webSocketServer = new WebSocketServer({ noServer: true });
+  const webSocketServer = new WebSocketServer({
+    noServer: true,
+    // Disable automatic handling of `Sec-WebSocket-Protocol` header, Cloudflare
+    // Workers require users to include this header themselves in `Response`s:
+    // https://github.com/cloudflare/miniflare/issues/179
+    handleProtocols: () => false,
+  });
   const liveReloadServer = new WebSocketServer({ noServer: true });
 
   // Add custom headers included in response to WebSocket upgrade requests
@@ -461,9 +475,12 @@ export async function startServer<Plugins extends HTTPPluginSignatures>(
       const protocol = httpsEnabled ? "https" : "http";
       const accessibleHosts =
         host && host !== "0.0.0.0" ? [host] : getAccessibleHosts(true);
-      log.info(`Listening on ${host ?? ""}:${port}`);
+      const address = server.address();
+      const usedPort =
+        address && typeof address === "object" ? address.port : port;
+      log.info(`Listening on ${host ?? ""}:${usedPort}`);
       for (const accessibleHost of accessibleHosts) {
-        log.info(`- ${protocol}://${accessibleHost}:${port}`);
+        log.info(`- ${protocol}://${accessibleHost}:${usedPort}`);
       }
       resolve(server);
     });

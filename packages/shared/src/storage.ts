@@ -1,3 +1,4 @@
+import type { SqliteDB } from "./sqlite";
 import { Awaitable } from "./sync";
 
 export interface StoredMeta<Meta = unknown> {
@@ -36,11 +37,42 @@ export interface Range {
   length?: number;
   suffix?: number;
 }
+export interface ParsedRange {
+  offset: number;
+  length: number;
+}
+export function parseRange(
+  { offset, length, suffix }: Range,
+  size: number
+): ParsedRange {
+  if (suffix !== undefined) {
+    if (suffix <= 0) {
+      throw new Error("Suffix must be > 0");
+    }
+    if (suffix > size) suffix = size;
+    offset = size - suffix;
+    length = size - offset;
+  }
+  if (offset === undefined) offset = 0;
+  if (length === undefined) length = size - offset;
+
+  // If offset is negative or greater than size, throw an error
+  if (offset < 0) throw new Error("Offset must be >= 0");
+  if (offset > size) throw new Error("Offset must be < size");
+  // If length is less than or equal to 0, throw an error
+  if (length <= 0) throw new Error("Length must be > 0");
+  // If length goes beyond actual length, adjust length to the end of the value
+  if (offset + length > size) length = size - offset;
+
+  return { offset, length };
+}
 
 export interface StorageListOptions {
   // Stage 1: filtering
   /** Returned keys must start with this string if defined */
   prefix?: string;
+  /** Returned keys must NOT start with this string if defined */
+  excludePrefix?: string;
   /** Returned keys must be lexicographically >= this string if defined */
   start?: string;
   /** Returned keys must be lexicographically < this string if defined */
@@ -116,6 +148,9 @@ export abstract class Storage {
     options: StorageListOptions,
     skipMetadata: true
   ): Awaitable<StorageListResult<StoredKey>>;
+  async getSqliteDatabase(): Promise<SqliteDB> {
+    throw new Error("D1 not implemented for this Storage class");
+  }
 
   // Batch functions, default implementations may be overridden to optimise
 
@@ -158,6 +193,6 @@ export abstract class Storage {
 }
 
 export interface StorageFactory {
-  storage(namespace: string, persist?: boolean | string): Awaitable<Storage>;
+  storage(namespace: string, persist?: boolean | string): Storage;
   dispose?(): Awaitable<void>;
 }

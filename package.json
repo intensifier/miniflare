@@ -1,7 +1,7 @@
 {
   "private": true,
   "name": "@miniflare/root",
-  "version": "2.6.0",
+  "version": "2.14.4",
   "description": "Fun, full-featured, fully-local simulator for Cloudflare Workers",
   "keywords": [
     "cloudflare",
@@ -22,21 +22,25 @@
     "types:bundle": "npm run types:build && node scripts/types.mjs",
     "dev": "node scripts/build.mjs watch",
     "test": "npm run build && ava && rimraf ./.tmp",
-    "lint": "eslint 'packages/*/{src,test}/**/*.ts' 'packages/miniflare/bootstrap.js' 'scripts/**/*.{js,mjs}' 'types/**/*.ts'",
+    "lint": "eslint --max-warnings=0 \"packages/*/{src,test}/**/*.ts\" \"packages/miniflare/bootstrap.js\" \"scripts/**/*.{js,mjs}\" \"types/**/*.ts\"",
     "lint:fix": "npm run lint -- --fix",
     "prepublishOnly": "npm run lint && npm run clean && npm run build && npm run types:bundle && npm run test",
     "helpers:scaffold": "node scripts/scaffold.mjs",
-    "helpers:version": "node scripts/version.mjs"
+    "helpers:version": "node scripts/version.mjs",
+    "postinstall": "patch-package"
   },
   "devDependencies": {
     "@ava/typescript": "^2.0.0",
+    "@changesets/cli": "^2.24.3",
     "@microsoft/api-extractor": "^7.19.4",
-    "@types/node": "^17.0.35",
+    "@types/node": "^18.7.15",
     "@types/rimraf": "^3.0.2",
+    "@types/sinon": "^10.0.13",
     "@types/which": "^2.0.1",
     "@typescript-eslint/eslint-plugin": "^5.9.1",
     "@typescript-eslint/parser": "^5.9.1",
     "ava": "^3.15.0",
+    "better-sqlite3": "^8.0.1",
     "esbuild": "^0.12.20",
     "eslint": "^8.6.0",
     "eslint-config-prettier": "^8.3.0",
@@ -44,15 +48,17 @@
     "eslint-plugin-import": "^2.24.2",
     "eslint-plugin-prettier": "^3.4.1",
     "esm": "^3.2.25",
+    "patch-package": "^8.0.0",
     "prettier": "^2.3.2",
     "rimraf": "^3.0.2",
+    "sinon": "^14.0.0",
     "typescript": "^4.5.4",
     "which": "^2.0.2"
   },
   "engines": {
-    "node": ">=16.7"
+    "node": ">=16.13"
   },
   "volta": {
-    "node": "18.2.0"
+    "node": "16.13.0"
   }
 }

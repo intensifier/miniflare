@@ -5,6 +5,7 @@ import {
   Storage,
   StoredValue,
   addAll,
+  lexicographicCompare,
   runWithInputGateClosed,
   viewToArray,
   waitUntilOnOutputGate,
@@ -128,21 +129,21 @@ function helpfulDeserialize(buffer: NodeJS.TypedArray): any {
 async function get<Value = unknown>(
   storage: Storage,
   key: string,
-  checkMaxKeys?: boolean
+  listing?: boolean
 ): Promise<Value | undefined>;
 // noinspection JSUnusedLocalSymbols
 async function get<Value = unknown>(
   storage: Storage,
   keys: string[],
-  checkMaxKeys?: boolean
+  listing?: boolean
 ): Promise<Map<string, Value>>;
 async function get<Value = unknown>(
   storage: Storage,
   keys: string | string[],
-  checkMaxKeys = true
+  listing = false
 ): Promise<Value | undefined | Map<string, Value>> {
   if (Array.isArray(keys)) {
-    if (checkMaxKeys && keys.length > MAX_KEYS) {
+    if (!listing && keys.length > MAX_KEYS) {
       throw new RangeError(`Maximum number of keys is ${MAX_KEYS}.`);
     }
     // Filter out undefined keys
@@ -151,6 +152,12 @@ async function get<Value = unknown>(
       if (key === undefined) continue;
       defined.push(key);
       assertKeySize(key, true);
+    }
+    if (!listing) {
+      // Return results in lexicographic order if not `list()`ing (where keys
+      // will already be sorted, and we may want to return in reverse)
+      // https://github.com/cloudflare/miniflare/issues/393
+      defined.sort(lexicographicCompare);
     }
     // If array of keys passed, build map of results
     const res = new Map<string, Value>();
@@ -212,8 +219,9 @@ async function list<Value = unknown>(
   return get(
     storage,
     keyNames,
-    // Allow listing more than MAX_KEYS keys
-    false /* checkMaxKeys */
+    // Allow listing more than MAX_KEYS keys and disable lexicographic sort
+    // (if `reverse` is `true`, we want keys to be returned in reverse)
+    true /* listing */
   );
 }
 
@@ -272,6 +280,8 @@ const kWriteSet = Symbol("kWriteSet");
 export const kAlarmExists = Symbol("kAlarmExists");
 
 export class DurableObjectTransaction implements DurableObjectOperator {
+  readonly #mutex = new ReadWriteMutex();
+
   readonly [kInner]: ShadowStorage;
   readonly [kStartTxnCount]: number;
   [kRolledback] = false;
@@ -325,7 +335,7 @@ export class DurableObjectTransaction implements DurableObjectOperator {
     }
     this.#check("get");
     return runWithInputGateClosed(
-      () => get(this[kInner], keys as any),
+      () => this.#mutex.runWithRead(() => get(this[kInner], keys as any)),
       options?.allowConcurrency
     );
   }
@@ -363,7 +373,8 @@ export class DurableObjectTransaction implements DurableObjectOperator {
     if (!options && typeof keyEntries !== "string") options = valueOptions;
     return waitUntilOnOutputGate(
       runWithInputGateClosed(
-        () => this.#put(keyEntries, valueOptions),
+        () =>
+          this.#mutex.runWithWrite(() => this.#put(keyEntries, valueOptions)),
         options?.allowConcurrency
       ),
       options?.allowUnconfirmed
@@ -394,7 +405,7 @@ export class DurableObjectTransaction implements DurableObjectOperator {
     this.#check("delete");
     return waitUntilOnOutputGate(
       runWithInputGateClosed(
-        () => this.#delete(keys),
+        () => this.#mutex.runWithWrite(() => this.#delete(keys)),
         options?.allowConcurrency
       ),
       options?.allowUnconfirmed
@@ -410,7 +421,7 @@ export class DurableObjectTransaction implements DurableObjectOperator {
   ): Promise<Map<string, Value>> {
     this.#check("list");
     return runWithInputGateClosed(
-      () => list(this[kInner], options),
+      () => this.#mutex.runWithRead(() => list(this[kInner], options)),
       options.allowConcurrency
     );
   }
@@ -421,7 +432,7 @@ export class DurableObjectTransaction implements DurableObjectOperator {
     this.#check("getAlarm");
     if (!this[kAlarmExists]) return null;
     return runWithInputGateClosed(
-      () => this[kInner].getAlarm(),
+      () => this.#mutex.runWithRead(() => this[kInner].getAlarm()),
       options?.allowConcurrency
     );
   }
@@ -438,7 +449,8 @@ export class DurableObjectTransaction implements DurableObjectOperator {
     }
     return waitUntilOnOutputGate(
       runWithInputGateClosed(
-        () => this[kInner].setAlarm(scheduledTime),
+        () =>
+          this.#mutex.runWithWrite(() => this[kInner].setAlarm(scheduledTime)),
         options?.allowConcurrency
       ),
       options?.allowUnconfirmed
@@ -449,7 +461,7 @@ export class DurableObjectTransaction implements DurableObjectOperator {
     this.#check("deleteAlarm");
     return waitUntilOnOutputGate(
       runWithInputGateClosed(
-        () => this[kInner].deleteAlarm(),
+        () => this.#mutex.runWithWrite(() => this[kInner].deleteAlarm()),
         options?.allowConcurrency
       ),
       options?.allowUnconfirmed
@@ -467,16 +479,6 @@ export class DurableObjectTransaction implements DurableObjectOperator {
 // maximum number of concurrent transactions we expect to be running on a single
 // storage instance
 const txnWriteSetsMaxSize = 16;
-
-function runWithGatesClosed<T>(
-  closure: () => Promise<T>,
-  options?: DurableObjectPutOptions
-): Promise<T> {
-  return waitUntilOnOutputGate(
-    runWithInputGateClosed(closure, options?.allowConcurrency),
-    options?.allowUnconfirmed
-  );
-}
 
 export class DurableObjectStorage implements DurableObjectOperator {
   readonly #mutex = new ReadWriteMutex();
@@ -503,6 +505,49 @@ export class DurableObjectStorage implements DurableObjectOperator {
     this.#alarmBridge = alarmBridge;
     // false disables recording readSet, only needed for transactions
     this.#shadow = new ShadowStorage(inner, false);
+  }
+
+  #pendingFlushes = 0;
+  #noPendingFlushesPromise?: Promise<void>;
+  #noPendingFlushesPromiseResolve?: () => void;
+
+  async #runWrite<T>(
+    closure: () => Promise<T>,
+    options?: DurableObjectPutOptions
+  ): Promise<T> {
+    // All write operations should eventually call `flush()`, so increment the
+    // pending flush count.
+    this.#pendingFlushes++;
+    if (this.#noPendingFlushesPromise === undefined) {
+      // There are now pending flushes, so make sure we have a promise that
+      // resolves when these complete.
+      assert(this.#noPendingFlushesPromiseResolve === undefined);
+      this.#noPendingFlushesPromise = new Promise(
+        (resolve) => (this.#noPendingFlushesPromiseResolve = resolve)
+      );
+    }
+
+    try {
+      // All write operations should close both I/O gates, unless otherwise
+      // configured.
+      return await waitUntilOnOutputGate(
+        runWithInputGateClosed(closure, options?.allowConcurrency),
+        options?.allowUnconfirmed
+      );
+    } finally {
+      // Either we returned successfully (calling `flush()` somewhere along
+      // the line), or we threw an exception. Either way, decrement the pending
+      // flush count.
+      assert(this.#pendingFlushes > 0);
+      assert(this.#noPendingFlushesPromiseResolve !== undefined);
+      this.#pendingFlushes--;
+      if (this.#pendingFlushes === 0) {
+        // If there are no more pending flushes, resolve the promise.
+        this.#noPendingFlushesPromiseResolve();
+        this.#noPendingFlushesPromiseResolve = undefined;
+        this.#noPendingFlushesPromise = undefined;
+      }
+    }
   }
 
   async #txnRead<T>(
@@ -565,7 +610,7 @@ export class DurableObjectStorage implements DurableObjectOperator {
     closure: (txn: DurableObjectTransaction) => Promise<T>
   ): Promise<T> {
     // Close input and output gate, we don't know what this transaction will do
-    return runWithGatesClosed(async () => {
+    return this.#runWrite(async () => {
       // TODO (someday): maybe throw exception after n retries?
       while (true) {
         const outputGate = new OutputGate();
@@ -702,7 +747,7 @@ export class DurableObjectStorage implements DurableObjectOperator {
 
     const entries = normalisePutEntries(keyEntries, valueOptions);
     if (!options && typeof keyEntries !== "string") options = valueOptions;
-    return runWithGatesClosed(async () => {
+    return this.#runWrite(async () => {
       await this.#mutex.runWithWrite(() => {
         for (const [key, value] of entries) this.#shadow.put(key, value);
         // "Commit" write
@@ -733,7 +778,7 @@ export class DurableObjectStorage implements DurableObjectOperator {
     let deleted = 0;
     const deletedKeySet: string[] = [];
 
-    return runWithGatesClosed(async () => {
+    return this.#runWrite(async () => {
       await this.#mutex.runWithWrite(() => {
         for (const key of keys) {
           // Filter out undefined keys
@@ -780,7 +825,7 @@ export class DurableObjectStorage implements DurableObjectOperator {
   }
 
   async deleteAll(options?: DurableObjectPutOptions): Promise<void> {
-    return runWithGatesClosed(
+    return this.#runWrite(
       () =>
         this.#mutex.runWithWrite(async () => {
           const { keys } = await this.#shadow.list();
@@ -823,9 +868,9 @@ export class DurableObjectStorage implements DurableObjectOperator {
         "Your Durable Object class must have an alarm() handler in order to call setAlarm()"
       );
     }
-    return runWithGatesClosed(async () => {
+    return this.#runWrite(async () => {
       await this.#mutex.runWithWrite(async () => {
-        this.#shadow.setAlarm(scheduledTime);
+        await this.#shadow.setAlarm(scheduledTime);
         // "Commit" write
         this.#txnRecordWriteSet(new Set([ALARM_KEY]));
       });
@@ -836,7 +881,7 @@ export class DurableObjectStorage implements DurableObjectOperator {
   }
 
   async deleteAlarm(options?: DurableObjectSetAlarmOptions): Promise<void> {
-    return runWithGatesClosed(async () => {
+    return this.#runWrite(async () => {
       await this.#mutex.runWithWrite(async () => {
         await this.#shadow.deleteAlarm();
         // "Commit" write
@@ -846,5 +891,11 @@ export class DurableObjectStorage implements DurableObjectOperator {
       await Promise.resolve();
       return this.#mutex.runWithWrite(this.#flush);
     }, options);
+  }
+
+  sync(): Promise<void> {
+    // https://community.cloudflare.com/t/2022-10-21-workers-runtime-release-notes/428663
+    // https://github.com/cloudflare/workerd/pull/87
+    return this.#noPendingFlushesPromise ?? Promise.resolve();
   }
 }

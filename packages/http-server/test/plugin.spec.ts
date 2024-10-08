@@ -3,18 +3,21 @@ import { existsSync } from "fs";
 import fs from "fs/promises";
 import path from "path";
 import { HTTPPlugin } from "@miniflare/http-server";
+import { QueueBroker } from "@miniflare/queues";
 import {
   Clock,
   Compatibility,
   LogLevel,
   NoOpLog,
   PluginContext,
+  QueueEventDispatcher,
 } from "@miniflare/shared";
 import {
   TestLog,
   logPluginOptions,
   parsePluginArgv,
   parsePluginWranglerConfig,
+  unusable,
   useServer,
   useTmp,
 } from "@miniflare/shared-test";
@@ -23,7 +26,16 @@ import test from "ava";
 const log = new NoOpLog();
 const compat = new Compatibility();
 const rootPath = process.cwd();
-const ctx: PluginContext = { log, compat, rootPath };
+const queueBroker = new QueueBroker();
+const queueEventDispatcher: QueueEventDispatcher = async (_batch) => {};
+const ctx: PluginContext = {
+  log,
+  compat,
+  rootPath,
+  queueBroker,
+  queueEventDispatcher,
+  sharedCache: unusable(),
+};
 
 test("HTTPPlugin: parses options from argv", (t) => {
   let options = parsePluginArgv(HTTPPlugin, [
@@ -226,7 +238,7 @@ test("HTTPPlugin: setupCf: cf fetch caches cf.json at default location", async (
   );
   const log = new TestLog();
   const plugin = new HTTPPlugin(
-    { log, compat, rootPath },
+    { ...ctx, log },
     {},
     { cfPath, cfFetch: true, cfFetchEndpoint: upstream }
   );
@@ -247,7 +259,7 @@ test("HTTPPlugin: setupCf: cf fetch caches cf.json at custom location", async (t
   );
   const log = new TestLog();
   const plugin = new HTTPPlugin(
-    { log, compat, rootPath },
+    { ...ctx, log },
     { cfFetch: customCfPath },
     { cfPath: defaultCfPath, cfFetch: true, cfFetchEndpoint: upstream }
   );
@@ -290,7 +302,7 @@ test("HTTPPlugin: setupCf: cf fetch refetches cf.json if stale", async (t) => {
   );
   const log = new TestLog();
   const plugin = new HTTPPlugin(
-    { log, compat, rootPath },
+    { ...ctx, log },
     {},
     { cfPath, cfFetch: true, cfFetchEndpoint: upstream, clock }
   );
@@ -382,7 +394,7 @@ test("HTTPPlugin: setupHttps: generates self-signed certificate at default locat
   const log = new TestLog();
   const tmp = await useTmp(t);
   const plugin = new HTTPPlugin(
-    { log, compat, rootPath },
+    { ...ctx, log },
     { https: true },
     { certRoot: tmp }
   );
@@ -407,7 +419,7 @@ test("HTTPPlugin: setupHttps: generates self-signed certificate at custom locati
   const tmpDefault = await useTmp(t);
   const tmpCustom = await useTmp(t);
   const plugin = new HTTPPlugin(
-    { log, compat, rootPath },
+    { ...ctx, log },
     { https: tmpCustom },
     { certRoot: tmpDefault }
   );
@@ -435,7 +447,7 @@ test("HTTPPlugin: setupHttps: reuses existing non-expired certificates", async (
   await fs.writeFile(path.join(tmp, "key.pem"), "existing_key", "utf8");
   await fs.writeFile(path.join(tmp, "cert.pem"), "existing_cert", "utf8");
   const plugin = new HTTPPlugin(
-    { log, compat, rootPath },
+    { ...ctx, log },
     { https: true },
     { certRoot: tmp }
   );
@@ -457,7 +469,7 @@ test("HTTPPlugin: setupHttps: regenerates self-signed certificate if expired", a
   await fs.writeFile(path.join(tmp, "cert.pem"), "expired_cert", "utf8");
   const clock: Clock = () => Date.now() + 86400000 * 30; // now + 30 days
   const plugin = new HTTPPlugin(
-    { log, compat, rootPath },
+    { ...ctx, log },
     { https: true },
     { certRoot: tmp, clock }
   );

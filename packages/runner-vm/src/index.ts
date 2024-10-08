@@ -1,6 +1,7 @@
 import vm from "vm";
 import {
   AdditionalModules,
+  Compatibility,
   Context,
   ProcessedModuleRule,
   ScriptBlueprint,
@@ -28,13 +29,14 @@ export class VMScriptRunner implements ScriptRunner {
   private async runAsModule(
     context: vm.Context,
     blueprint: ScriptBlueprint,
-    linker: vm.ModuleLinker
+    linker: ModuleLinker
   ): Promise<Context> {
     const module = new vm.SourceTextModule(blueprint.code, {
       identifier: blueprint.filePath,
       context,
+      importModuleDynamically: linker.importModuleDynamically,
     });
-    await module.link(linker);
+    await module.link(linker.linker);
     await module.evaluate();
     return module.namespace;
   }
@@ -43,7 +45,8 @@ export class VMScriptRunner implements ScriptRunner {
     globalScope: Context,
     blueprint: ScriptBlueprint,
     modulesRules?: ProcessedModuleRule[],
-    additionalModules?: AdditionalModules
+    additionalModules?: AdditionalModules,
+    compat?: Compatibility
   ): Promise<ScriptRunnerResult> {
     // If we're using modules, make sure --experimental-vm-modules is enabled
     if (modulesRules && !("SourceTextModule" in vm)) {
@@ -54,7 +57,8 @@ export class VMScriptRunner implements ScriptRunner {
     }
     // Also build a linker if we're using modules
     const linker =
-      modulesRules && new ModuleLinker(modulesRules, additionalModules ?? {});
+      modulesRules &&
+      new ModuleLinker(modulesRules, additionalModules ?? {}, compat);
 
     let context = this.context;
     if (context) {
@@ -79,7 +83,7 @@ export class VMScriptRunner implements ScriptRunner {
     if (linker) {
       // If we have a linker, we must've passed module rules so run as module,
       // storing exported namespace
-      exports = await this.runAsModule(context, blueprint, linker.linker);
+      exports = await this.runAsModule(context, blueprint, linker);
     } else {
       this.runAsScript(context, blueprint);
     }

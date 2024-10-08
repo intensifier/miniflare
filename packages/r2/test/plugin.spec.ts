@@ -1,10 +1,12 @@
 import assert from "assert";
 import path from "path";
+import { QueueBroker } from "@miniflare/queues";
 import { R2Bucket, R2Plugin } from "@miniflare/r2";
 import {
   Compatibility,
   NoOpLog,
   PluginContext,
+  QueueEventDispatcher,
   StoredValueMeta,
 } from "@miniflare/shared";
 import {
@@ -12,6 +14,7 @@ import {
   logPluginOptions,
   parsePluginArgv,
   parsePluginWranglerConfig,
+  unusable,
   useTmp,
 } from "@miniflare/shared-test";
 import test from "ava";
@@ -19,7 +22,17 @@ import test from "ava";
 const log = new NoOpLog();
 const compat = new Compatibility();
 const rootPath = process.cwd();
-const ctx: PluginContext = { log, compat, rootPath, globalAsyncIO: true };
+const queueBroker = new QueueBroker();
+const queueEventDispatcher: QueueEventDispatcher = async (_batch) => {};
+const ctx: PluginContext = {
+  log,
+  compat,
+  rootPath,
+  queueBroker,
+  queueEventDispatcher,
+  globalAsyncIO: true,
+  sharedCache: unusable(),
+};
 
 test("R2Plugin: parses options from argv", (t) => {
   let options = parsePluginArgv(R2Plugin, [
@@ -68,7 +81,7 @@ test("R2Plugin: getBucket: creates bucket", async (t) => {
   const factory = new MemoryStorageFactory({ ["test://map:BUCKET"]: map });
 
   const plugin = new R2Plugin(ctx, { r2Persist: "test://map" });
-  const bucket = await plugin.getBucket(factory, "BUCKET");
+  const bucket = plugin.getBucket(factory, "BUCKET");
   await bucket.put("key", "value");
   t.true(map.has("key"));
 });
@@ -79,11 +92,8 @@ test("R2Plugin: getBucket: resolves persist path relative to rootPath", async (t
     [`${tmp}${path.sep}test:BUCKET`]: map,
   });
 
-  const plugin = new R2Plugin(
-    { log, compat, rootPath: tmp },
-    { r2Persist: "test" }
-  );
-  const bucket = await plugin.getBucket(factory, "BUCKET");
+  const plugin = new R2Plugin({ ...ctx, rootPath: tmp }, { r2Persist: "test" });
+  const bucket = plugin.getBucket(factory, "BUCKET");
   await bucket.put("key", "value");
   t.true(map.has("key"));
 });
@@ -112,7 +122,7 @@ test("R2Plugin: setup: includes buckets in bindings", async (t) => {
 test("R2Plugin: setup: operations throw outside request handler unless globalAsyncIO set", async (t) => {
   const factory = new MemoryStorageFactory();
   let plugin = new R2Plugin(
-    { log, compat, rootPath },
+    { ...ctx, globalAsyncIO: false },
     { r2Buckets: ["BUCKET"] }
   );
   let r2: R2Bucket = (await plugin.setup(factory)).bindings?.BUCKET;
@@ -122,9 +132,30 @@ test("R2Plugin: setup: operations throw outside request handler unless globalAsy
   });
 
   plugin = new R2Plugin(
-    { log, compat, rootPath, globalAsyncIO: true },
+    { ...ctx, globalAsyncIO: true },
     { r2Buckets: ["BUCKET"] }
   );
   r2 = (await plugin.setup(factory)).bindings?.BUCKET;
   await r2.get("key");
+});
+test('R2Plugin: setup: implicitly includes customMetadata & httpMetadata if "r2_list_honor_include" flag not set', async (t) => {
+  const factory = new MemoryStorageFactory();
+  let compat = new Compatibility();
+  let plugin = new R2Plugin({ ...ctx, compat }, { r2Buckets: ["BUCKET"] });
+  let r2 = plugin.getBucket(factory, "BUCKET");
+
+  await r2.put("key", "value", {
+    customMetadata: { foo: "bar" },
+    httpMetadata: { contentEncoding: "gzip" },
+  });
+  let { objects } = await r2.list({ include: [] });
+  t.deepEqual(objects[0].customMetadata, { foo: "bar" });
+  t.deepEqual(objects[0].httpMetadata, { contentEncoding: "gzip" });
+
+  compat = new Compatibility(undefined, ["r2_list_honor_include"]);
+  plugin = new R2Plugin({ ...ctx, compat }, { r2Buckets: ["BUCKET"] });
+  r2 = plugin.getBucket(factory, "BUCKET");
+  ({ objects } = await r2.list({ include: [] }));
+  t.deepEqual(objects[0].customMetadata, {});
+  t.deepEqual(objects[0].httpMetadata, {});
 });

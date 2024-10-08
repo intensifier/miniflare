@@ -10,6 +10,8 @@ import {
   ReadableStreamBYOBRequest,
   ReadableStreamDefaultController,
   ReadableStreamDefaultReader,
+  TextDecoderStream,
+  TextEncoderStream,
   TransformStream,
   TransformStreamDefaultController,
   WritableStream,
@@ -22,8 +24,8 @@ import {
 import webStreams from "stream/web";
 import { URL, URLSearchParams } from "url";
 import { TextDecoder, TextEncoder } from "util";
-import { deserialize, serialize } from "v8";
 import {
+  AdditionalModules,
   CompatibilityFlag,
   Context,
   ModuleRule,
@@ -33,21 +35,25 @@ import {
   Plugin,
   PluginContext,
   ProcessedModuleRule,
+  RouteType,
   STRING_SCRIPT_PATH,
   SetupResult,
   globsToMatcher,
+  structuredCloneImpl,
 } from "@miniflare/shared";
-import { File, FormData, Headers } from "undici";
+import { File, FormData, Headers, MockAgent } from "undici";
 // @ts-expect-error `urlpattern-polyfill` only provides global types
 import { URLPattern } from "urlpattern-polyfill";
 import { MiniflareCoreError } from "../error";
 import {
   AbortSignal,
   CompressionStream,
+  CryptoKey,
   DOMException,
   DecompressionStream,
   FetchEvent,
   FixedLengthStream,
+  IdentityTransformStream,
   Navigator,
   Request,
   Response,
@@ -60,10 +66,12 @@ import {
   createCrypto,
   createDate,
   createTimer,
+  fetch,
   withStringFormDataFiles,
 } from "../standards";
 import { assertsInRequest } from "../standards/helpers";
 import type { BindingsOptions } from "./bindings";
+import { additionalNodeModules } from "./node";
 
 const DEFAULT_MODULE_RULES: ModuleRule[] = [
   { type: "ESModule", include: ["**/*.mjs"] },
@@ -81,9 +89,19 @@ function proxyStringFormDataFiles<
   });
 }
 
-// Approximation of structuredClone for Node < 17.0.0
-function structuredCloneBuffer<T>(value: T): T {
-  return deserialize(serialize(value));
+function proxyDisableStreamConstructor<
+  Class extends
+    | typeof ReadableStream
+    | typeof WritableStream
+    | typeof TransformStream
+>(klass: Class) {
+  return new Proxy(klass, {
+    construct() {
+      throw new Error(
+        `To use the new ${klass.name}() constructor, enable the streams_enable_constructors feature flag.`
+      );
+    },
+  });
 }
 
 export interface CoreOptions {
@@ -110,10 +128,12 @@ export interface CoreOptions {
   name?: string;
   routes?: string[];
   logUnhandledRejections?: boolean;
+  fetchMock?: MockAgent;
   globalAsyncIO?: boolean;
   globalTimers?: boolean;
   globalRandom?: boolean;
   actualTime?: boolean;
+  inaccurateCpu?: boolean;
 }
 
 function mapMountEntries(
@@ -261,7 +281,10 @@ export class CorePlugin extends Plugin<CoreOptions> implements CoreOptions {
     type: OptionType.BOOLEAN,
     alias: "w",
     description: "Watch files for changes",
-    fromWrangler: ({ miniflare }) => miniflare?.watch,
+    fromWrangler: ({ miniflare }) => {
+      if (miniflare?.watch !== undefined) return miniflare.watch;
+      if (miniflare?.live_reload) return true;
+    },
   })
   watch?: boolean;
 
@@ -328,18 +351,23 @@ export class CorePlugin extends Plugin<CoreOptions> implements CoreOptions {
     type: OptionType.ARRAY,
     description: "Route to respond with this worker on",
     fromWrangler: ({ route, routes, miniflare }) => {
-      const result: string[] = [];
+      const result: RouteType[] = [];
+      const toPattern = (route: RouteType): string =>
+        typeof route === "string" ? route : route.pattern;
       if (route) result.push(route);
       if (routes) result.push(...routes);
       if (miniflare?.route) result.push(miniflare.route);
       if (miniflare?.routes) result.push(...miniflare.routes);
-      return result.length ? result : undefined;
+      return result.length ? result.map(toPattern) : undefined;
     },
   })
   routes?: string[];
 
   @Option({ type: OptionType.NONE })
   logUnhandledRejections?: boolean;
+
+  @Option({ type: OptionType.NONE })
+  fetchMock?: MockAgent;
 
   @Option({
     type: OptionType.BOOLEAN,
@@ -373,10 +401,19 @@ export class CorePlugin extends Plugin<CoreOptions> implements CoreOptions {
   })
   actualTime?: boolean;
 
+  @Option({
+    type: OptionType.BOOLEAN,
+    description: "Log inaccurate CPU time measurements",
+    logName: "Inaccurate CPU Time Measurements",
+    fromWrangler: ({ miniflare }) => miniflare?.inaccurate_cpu,
+  })
+  inaccurateCpu?: boolean;
+
   readonly processedModuleRules: ProcessedModuleRule[] = [];
 
   readonly upstreamURL?: URL;
   readonly #globals: Context;
+  readonly #additionalModules?: AdditionalModules;
 
   constructor(ctx: PluginContext, options?: CoreOptions) {
     super(ctx);
@@ -387,21 +424,79 @@ export class CorePlugin extends Plugin<CoreOptions> implements CoreOptions {
       );
     }
 
+    const nodejsCompat = ctx.compat.isEnabled("nodejs_compat");
+    if (nodejsCompat) {
+      const experimental = ctx.compat.isEnabled("experimental");
+      this.#additionalModules = additionalNodeModules(experimental);
+    }
+
+    const extraGlobals: Context = {};
+
     // Make sure the kFormDataFiles flag is set correctly when constructing
     let CompatRequest = Request;
     let CompatResponse = Response;
-    const formDataFiles = ctx.compat.isEnabled(
-      "formdata_parser_supports_files"
-    );
-    if (!formDataFiles) {
-      CompatRequest = proxyStringFormDataFiles(CompatRequest);
-      CompatResponse = proxyStringFormDataFiles(CompatResponse);
+    if (!ctx.compat.isEnabled("formdata_parser_supports_files")) {
+      CompatRequest = proxyStringFormDataFiles(Request);
+      CompatResponse = proxyStringFormDataFiles(Response);
     }
 
     // Only include `navigator` if `global_navigator` compatibility flag is set
-    const compatGlobals: Context = {};
     if (ctx.compat.isEnabled("global_navigator")) {
-      compatGlobals.navigator = new Navigator();
+      extraGlobals.navigator = new Navigator();
+      extraGlobals.Navigator = Navigator;
+    }
+
+    const enableStreamConstructors = ctx.compat.isEnabled(
+      "streams_enable_constructors"
+    );
+    const enableTransformStreamConstructor = ctx.compat.isEnabled(
+      "transformstream_enable_standard_constructor"
+    );
+    let CompatReadableStream = ReadableStream;
+    let CompatWritableStream = WritableStream;
+    let CompatTransformStream:
+      | typeof TransformStream
+      | typeof IdentityTransformStream = TransformStream;
+    // Disable stream constructors if `streams_enable_constructors`
+    // compatibility flag not set
+    if (!enableStreamConstructors) {
+      CompatReadableStream = proxyDisableStreamConstructor(ReadableStream);
+      CompatWritableStream = proxyDisableStreamConstructor(WritableStream);
+      // If `transformstream_enable_standard_constructor` flag set, but
+      // `streams_enable_constructors` not set, disable `TransformStream`
+      // constructor
+      if (enableTransformStreamConstructor) {
+        CompatTransformStream = proxyDisableStreamConstructor(TransformStream);
+      }
+    }
+    // If `transformstream_enable_standard_constructor` flag not set, use
+    // non-spec `IdentityTransformStream` implementation instead
+    if (!enableTransformStreamConstructor) {
+      CompatTransformStream = new Proxy(IdentityTransformStream, {
+        construct(target, args, newTarget) {
+          if (args.length > 0) {
+            ctx.log.warn(
+              "To use the new TransformStream() constructor with a custom transformer, enable the transformstream_enable_standard_constructor feature flag."
+            );
+          }
+          return Reflect.construct(target, args, newTarget);
+        },
+      });
+    }
+
+    // Only include stream controllers if constructors enabled
+    if (enableStreamConstructors) {
+      extraGlobals.ReadableByteStreamController = ReadableByteStreamController;
+      extraGlobals.ReadableStreamBYOBRequest = ReadableStreamBYOBRequest;
+      extraGlobals.ReadableStreamDefaultController =
+        ReadableStreamDefaultController;
+      extraGlobals.WritableStreamDefaultController =
+        WritableStreamDefaultController;
+
+      if (enableTransformStreamConstructor) {
+        extraGlobals.TransformStreamDefaultController =
+          TransformStreamDefaultController;
+      }
     }
 
     // Try to parse upstream URL if set
@@ -420,12 +515,19 @@ export class CorePlugin extends Plugin<CoreOptions> implements CoreOptions {
     const crypto = createCrypto(!this.globalRandom);
 
     // `(De)CompressionStream`s were added in Node.js 17.0.0, and added to the
-    // global scope in Node.js 18.0.0. Our minimum supported version is 16.7.0,
+    // global scope in Node.js 18.0.0. Our minimum supported version is 16.13.0,
     // so we implement basic versions ourselves, preferring Node's if available.
     const CompressionStreamImpl =
       webStreams.CompressionStream ?? CompressionStream;
     const DecompressionStreamImpl =
       webStreams.DecompressionStream ?? DecompressionStream;
+
+    if (this.inaccurateCpu) {
+      ctx.log.warn(
+        "CPU time measurements are experimental, highly inaccurate and not representative of deployed worker performance.\n" +
+          "They should only be used for relative comparisons and may be removed in the future."
+      );
+    }
 
     // Build globals object
     // noinspection JSDeprecatedSymbols
@@ -451,11 +553,11 @@ export class CorePlugin extends Plugin<CoreOptions> implements CoreOptions {
       Math,
 
       crypto,
-      CryptoKey: crypto.CryptoKey,
+      CryptoKey,
       TextDecoder,
       TextEncoder,
 
-      fetch: createCompatFetch(ctx),
+      fetch: createCompatFetch(ctx, fetch.bind(this.fetchMock)),
       Headers,
       Request: CompatRequest,
       Response: CompatResponse,
@@ -466,22 +568,24 @@ export class CorePlugin extends Plugin<CoreOptions> implements CoreOptions {
       URLSearchParams,
       URLPattern,
 
+      ReadableStream: CompatReadableStream,
+      WritableStream: CompatWritableStream,
+      TransformStream: CompatTransformStream,
+
+      ReadableStreamBYOBReader,
+      ReadableStreamDefaultReader,
+      WritableStreamDefaultWriter,
+
       ByteLengthQueuingStrategy,
       CountQueuingStrategy,
-      ReadableByteStreamController,
-      ReadableStream,
-      ReadableStreamBYOBReader,
-      ReadableStreamBYOBRequest,
-      ReadableStreamDefaultController,
-      ReadableStreamDefaultReader,
-      TransformStream,
-      TransformStreamDefaultController,
-      WritableStream,
-      WritableStreamDefaultController,
-      WritableStreamDefaultWriter,
+
+      IdentityTransformStream,
       FixedLengthStream,
+
       CompressionStream: CompressionStreamImpl,
       DecompressionStream: DecompressionStreamImpl,
+      TextEncoderStream,
+      TextDecoderStream,
 
       Event,
       EventTarget,
@@ -495,12 +599,11 @@ export class CorePlugin extends Plugin<CoreOptions> implements CoreOptions {
       WorkerGlobalScope,
 
       // `structuredClone` was added to the global scope in Node 17.0.0.
-      // Approximate with serialize/deserialize if not there.
-      structuredClone: globalThis.structuredClone ?? structuredCloneBuffer,
+      structuredClone: globalThis.structuredClone ?? structuredCloneImpl,
 
       Date: createDate(this.actualTime),
 
-      ...compatGlobals,
+      ...extraGlobals,
 
       // The types below would be included automatically, but it's not possible
       // to create instances of them without using their constructors and they
@@ -558,12 +661,17 @@ export class CorePlugin extends Plugin<CoreOptions> implements CoreOptions {
 
   async setup(): Promise<SetupResult> {
     const globals = this.#globals;
+    const additionalModules = this.#additionalModules;
 
     // First, try to load script from string, no need to watch any files
     if (this.script !== undefined) {
       return {
         globals,
-        script: { filePath: STRING_SCRIPT_PATH, code: this.script },
+        additionalModules,
+        script: {
+          filePath: this.scriptPath ?? STRING_SCRIPT_PATH,
+          code: this.script,
+        },
       };
     }
 
@@ -595,11 +703,16 @@ export class CorePlugin extends Plugin<CoreOptions> implements CoreOptions {
       scriptPath = path.resolve(this.ctx.rootPath, scriptPath);
       const code = await fs.readFile(scriptPath, "utf8");
       watch.push(scriptPath);
-      return { globals, script: { filePath: scriptPath, code }, watch };
+      return {
+        globals,
+        additionalModules,
+        script: { filePath: scriptPath, code },
+        watch,
+      };
     }
 
     // If we couldn't load a script yet, keep watching package.json anyways, it
     // might get edited with a path
-    return { globals, watch };
+    return { globals, additionalModules, watch };
   }
 }
